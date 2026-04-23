@@ -1,0 +1,569 @@
+import json
+import os
+import random
+import time
+import uuid
+import requests
+import concurrent.futures
+import re as _re
+
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
+from src import const
+from src.helper import j, mask_kv, attach_auth_cookies, merge_login_at
+from src.helper import extract_t_token
+from src.novel import html_from_episode_text
+
+# ----------------------------
+# API Client
+# ----------------------------
+
+@dataclass
+class Tokens:
+    login_at: Optional[str] = None
+    tkey: Optional[str] = None
+    userkey: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class FetchProfile:
+    name: str
+    max_workers: int
+    periodic_rest_every: int
+    periodic_rest_min: float
+    periodic_rest_max: float
+    recover_attempts: int
+    recover_cooldown_min: float
+    recover_cooldown_max: float
+    recover_throttle: float
+    rotate_session_on_failure: bool
+
+
+FETCH_PROFILES: Dict[str, FetchProfile] = {
+    "safe": FetchProfile(
+        name="safe",
+        max_workers=1,
+        periodic_rest_every=10,
+        periodic_rest_min=45.0,
+        periodic_rest_max=75.0,
+        recover_attempts=3,
+        recover_cooldown_min=180.0,
+        recover_cooldown_max=300.0,
+        recover_throttle=4.0,
+        rotate_session_on_failure=True,
+    ),
+    "fast-rotate": FetchProfile(
+        name="fast-rotate",
+        max_workers=3,
+        periodic_rest_every=0,
+        periodic_rest_min=0.0,
+        periodic_rest_max=0.0,
+        recover_attempts=2,
+        recover_cooldown_min=20.0,
+        recover_cooldown_max=45.0,
+        recover_throttle=3.0,
+        rotate_session_on_failure=True,
+    ),
+}
+
+class NovelpiaClient:
+    def __init__(self, email: Optional[str] = None, password: Optional[str] = None,
+                 proxy: Optional[str] = None, timeout: int = 30, throttle: float = 1.5,
+                 userkey: Optional[str] = None, tkey: Optional[str] = None,
+                 fetch_profile: str = "safe"):
+        self.s = requests.Session()
+        self.s.headers.update(const.SESSION_HEADERS.copy())
+        if proxy:
+            self.s.proxies.update({"http": proxy, "https": proxy})
+        self.timeout = timeout
+        self.tokens = Tokens()
+        self.email = email
+        self.password = password
+        # delay seconds between episode-related API calls to reduce 429/500 rate limits
+        self.throttle = max(0.0, float(throttle or 1.5))
+        self.chapter_counter = 0
+        self.fetch_profile_name = "safe"
+        self.fetch_profile = FETCH_PROFILES["safe"]
+        self.rest_every_chapters = 10
+        self.rest_min_seconds = 45.0
+        self.rest_max_seconds = 75.0
+        self.default_max_workers = 1
+        self.recover_attempts = 3
+        self.recover_cooldown_min = 180.0
+        self.recover_cooldown_max = 300.0
+        self.recover_throttle = 4.0
+        self.rotate_session_on_failure = True
+        self.set_fetch_profile(fetch_profile)
+        try:
+            if not userkey:
+                userkey = uuid.uuid4().hex
+            self.s.cookies.set("USERKEY", userkey, domain=".novelpia.com", path="/")
+            self.tokens.userkey = userkey
+            if tkey:
+                self.s.cookies.set("TKEY", tkey, domain=".novelpia.com", path="/")
+                self.tokens.tkey = tkey
+        except Exception as e:
+            print(f"Error setting cookies: {e}")
+
+    def set_fetch_profile(self, profile_name: Optional[str]) -> None:
+        selected = FETCH_PROFILES.get((profile_name or "").strip().lower()) or FETCH_PROFILES["safe"]
+        self.fetch_profile_name = selected.name
+        self.fetch_profile = selected
+        self.rest_every_chapters = selected.periodic_rest_every
+        self.rest_min_seconds = selected.periodic_rest_min
+        self.rest_max_seconds = selected.periodic_rest_max
+        self.default_max_workers = max(1, selected.max_workers)
+        self.recover_attempts = max(1, selected.recover_attempts)
+        self.recover_cooldown_min = max(0.0, selected.recover_cooldown_min)
+        self.recover_cooldown_max = max(self.recover_cooldown_min, selected.recover_cooldown_max)
+        self.recover_throttle = max(0.0, selected.recover_throttle)
+        self.rotate_session_on_failure = bool(selected.rotate_session_on_failure)
+
+    def login(self):
+        url = f"{const.API_BASE}/v1/member/login"
+        r = request_with_retries(
+            self.s, "POST", url,
+            json={"email": self.email, "passwd": self.password},
+            timeout=self.timeout, max_retries=2,
+        )
+        r.raise_for_status()
+        data = r.json()
+        self.tokens.login_at = data["result"]["LOGINAT"]
+        # Capture cookies after successful login
+        try:
+            for c in self.s.cookies:
+                if c.name == "TKEY":
+                    self.tokens.tkey = c.value
+                elif c.name == "USERKEY":
+                    self.tokens.userkey = c.value
+        except Exception:
+            pass
+
+    def refresh(self) -> Optional[str]:
+        url = f"{const.API_BASE}/v1/login/refresh"
+        r = request_with_retries(
+            self.s, "GET", url,
+            headers=merge_login_at({}, self.tokens.login_at),
+            timeout=self.timeout, max_retries=2,
+        )
+        r.raise_for_status()
+        self.tokens.login_at = r.json()["result"]["LOGINAT"]
+        # Persist refreshed token to config
+        try:
+            cfg: Dict[str, Any] = {}
+            if os.path.exists(const.CONFIG_PATH):
+                try:
+                    with open(const.CONFIG_PATH, "r", encoding="utf-8") as f:
+                        cfg = json.load(f) or {}
+                except Exception as e:
+                    print(f"Error loading config: {e}")
+                    cfg = {}
+            cfg["login_at"] = self.tokens.login_at
+            with open(const.CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
+                pass
+        except Exception as e:
+            print(f"Error saving config: {e}")
+            pass
+        return self.tokens.login_at
+
+    def _on_rate_limit(self):
+        """Increase throttle when 429 occurs."""
+        old = self.throttle
+        self.throttle = min(15.0, self.throttle + 1.5)
+        if const.HTTP_LOG:
+            print(f"[api] Increased throttle from {old}s to {self.throttle}s due to rate limit.")
+
+    def me(self) -> Dict:
+        url = f"{const.API_BASE}/v1/login/me"
+        r = request_with_retries(
+            self.s, "GET", url,
+            headers=merge_login_at({}, self.tokens.login_at),
+            timeout=self.timeout, allow_refresh=True, 
+            refresh_fn=self.refresh, login_fn=self.login,
+            on_rate_limit=self._on_rate_limit
+        )
+        r.raise_for_status()
+        return r.json()
+
+    def novel(self, novel_id: int) -> Dict:
+        url = f"{const.API_BASE}/v1/novel"
+        r = request_with_retries(
+            self.s, "GET", url,
+            headers=merge_login_at({}, self.tokens.login_at),
+            params={"novel_no": novel_id},
+            timeout=self.timeout, allow_refresh=True, 
+            refresh_fn=self.refresh, login_fn=self.login,
+            on_rate_limit=self._on_rate_limit
+        )
+        r.raise_for_status()
+        return r.json()
+
+    def episode_list(self, novel_id: int, rows: int) -> Dict:
+        url = f"{const.API_BASE}/v1/novel/episode/list"
+        r = request_with_retries(
+            self.s, "GET", url,
+            headers=merge_login_at({}, self.tokens.login_at),
+            params={"novel_no": novel_id, "rows": rows, "sort": "ASC"},
+            timeout=self.timeout, allow_refresh=True, 
+            refresh_fn=self.refresh, login_fn=self.login,
+            on_rate_limit=self._on_rate_limit
+        )
+        r.raise_for_status()
+        return r.json()
+
+    def episode_ticket(self, episode_no: int) -> Dict:
+        url = f"{const.API_BASE}/v1/novel/episode"
+        headers = merge_login_at({}, self.tokens.login_at)
+        params = {"episode_no": episode_no}
+        # Throttle before hitting ticket endpoint to avoid rate limits
+        if self.throttle:
+            time.sleep(self.throttle + random.uniform(1.0, 1.5))
+        r = request_with_retries(
+            self.s, "GET", url,
+            headers=headers, params=params,
+            timeout=self.timeout, allow_refresh=True, 
+            refresh_fn=self.refresh, login_fn=self.login,
+            on_rate_limit=self._on_rate_limit, max_retries=4,
+        )
+        if r.status_code >= 400:
+            raise requests.HTTPError(describe_http_error(r), response=r)
+        return r.json()
+
+    def episode_content(self, token_t: str) -> Dict:
+        url = f"{const.API_BASE}/v1/novel/episode/content"
+        # Throttle content fetch too, to be safe
+        if self.throttle:
+            time.sleep(self.throttle + random.uniform(1.0, 1.5))
+        r = request_with_retries(
+            self.s, "GET", url,
+            params={"_t": token_t},
+            timeout=self.timeout, max_retries=3,
+            allow_refresh=True, refresh_fn=self.refresh, login_fn=self.login,
+            on_rate_limit=self._on_rate_limit
+        )
+        if r.status_code >= 400:
+            raise requests.HTTPError(describe_http_error(r), response=r)
+        return r.json()
+
+    def fetch_episode(self, ep: Dict, idx: int = 0) -> Dict:
+        """Fetch ticket and content for a single episode."""
+        episode_no = ep.get("episode_no")
+        if episode_no is None:
+            return {
+                "error": "missing episode_no",
+                "epi_no": None,
+                "epi_title": ep.get("epi_title") or f"Episode {ep.get('epi_num')}",
+                "idx": idx,
+            }
+        epi_no = int(episode_no)
+        epi_title = ep.get("epi_title") or f"Episode {ep.get('epi_num')}"
+        self.chapter_counter += 1
+        self._rest_if_needed(idx, epi_title)
+        
+        # 1) Ticket
+        try:
+            tdata = self.episode_ticket(epi_no)
+        except Exception as e:
+            return {"error": str(e), "epi_no": epi_no, "epi_title": epi_title, "idx": idx}
+
+        token_t, direct_url = extract_t_token(tdata)
+        if not token_t and not direct_url:
+            return {"error": "no token found", "epi_no": epi_no, "epi_title": epi_title, "idx": idx}
+
+        # 2) Content
+        try:
+            if token_t:
+                cdata = self.episode_content(token_t)
+            else:
+                assert direct_url is not None, "direct_url unavailable"
+                r = self.s.get(direct_url, timeout=self.timeout)
+                r.raise_for_status()
+                cdata = r.json()
+        except Exception as e:
+            return {"error": str(e), "epi_no": epi_no, "epi_title": epi_title, "idx": idx}
+
+        # 3) Extract HTML
+        result_block = cdata.get("result", {})
+        data_block = result_block.get("data", {}) if isinstance(result_block, dict) else {}
+
+        parts = []
+        try:
+            def _key(k: str):
+                m = _re.search(r"(\d+)$", k)
+                return (0 if k == "epi_content" else 1, int(m.group(1)) if m else 0)
+            for k in sorted([kk for kk in data_block.keys() if str(kk).startswith("epi_content")], key=_key):
+                v = data_block.get(k)
+                if isinstance(v, str) and v:
+                    parts.append(v)
+        except Exception:
+            pass
+
+        html_text = "".join(parts).strip()
+        if not html_text:
+            html_text = (
+                result_block.get("content")
+                or result_block.get("html")
+                or result_block.get("text")
+                or cdata.get("content")
+                or ""
+            )
+
+        return {
+            "html": html_from_episode_text(html_text),
+            "epi_title": epi_title,
+            "epi_no": epi_no,
+            "idx": idx,
+        }
+
+    def _rest_if_needed(self, idx: int, epi_title: str) -> None:
+        if self.chapter_counter <= 1:
+            return
+        if self.rest_every_chapters <= 0:
+            return
+        if self.chapter_counter % self.rest_every_chapters != 1:
+            return
+
+        wait = random.uniform(self.rest_min_seconds, self.rest_max_seconds)
+        print(
+            f"[info] Cooldown pause: waiting {wait:.1f}s before chapter {idx} ({epi_title}) "
+            f"after {self.rest_every_chapters} chapters."
+        )
+        time.sleep(wait)
+
+    def fetch_episodes_parallel(self, ep_list: List[Dict[str, Any]], max_workers: int = 1, progress_cb=None) -> List[Dict[str, Any]]:
+        """Fetch multiple episodes using the active fetch profile."""
+        worker_count = max(1, int(max_workers or self.default_max_workers or 1))
+        if worker_count <= 1:
+            return self._fetch_episodes_sequential(ep_list, progress_cb=progress_cb)
+        return self._fetch_episodes_concurrent(ep_list, max_workers=worker_count, progress_cb=progress_cb)
+
+    def _fetch_episodes_sequential(self, ep_list: List[Dict[str, Any]], progress_cb=None) -> List[Dict[str, Any]]:
+        results: List[Dict[str, Any]] = [{} for _ in range(len(ep_list))]
+        for idx, ep in enumerate(ep_list, 1):
+            res = self.fetch_episode(ep, idx)
+            if (not res) or ("error" in res):
+                err = res.get("error") if res else "Unknown error"
+                print(f"[warn] Chapter {idx} failed on first attempt: {err}")
+                res = self._recover_episode(ep, idx)
+            results[idx - 1] = res
+            if progress_cb:
+                ok = bool(res) and "error" not in res
+                progress_cb(idx, ok)
+        return results
+
+    def _fetch_episodes_concurrent(self, ep_list: List[Dict[str, Any]], max_workers: int, progress_cb=None) -> List[Dict[str, Any]]:
+        print(
+            f"[info] Using fast profile '{self.fetch_profile_name}' with {max_workers} concurrent workers."
+        )
+        results: List[Dict[str, Any]] = [{} for _ in range(len(ep_list))]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_map = {
+                executor.submit(self.fetch_episode, ep, idx): (idx, ep)
+                for idx, ep in enumerate(ep_list, 1)
+            }
+            for future in concurrent.futures.as_completed(future_map):
+                idx, ep = future_map[future]
+                try:
+                    res = future.result()
+                except Exception as e:
+                    res = {"error": str(e), "idx": idx}
+
+                if (not res) or ("error" in res):
+                    err = res.get("error") if res else "Unknown error"
+                    print(f"[warn] Chapter {idx} failed on initial fast attempt: {err}")
+                    res = self._recover_episode(ep, idx)
+
+                results[idx - 1] = res
+                if progress_cb:
+                    ok = bool(res) and "error" not in res
+                    progress_cb(idx, ok)
+        return results
+
+    def _recover_episode(self, ep: Dict[str, Any], idx: int) -> Dict[str, Any]:
+        old_throttle = self.throttle
+        retry_res: Optional[Dict[str, Any]] = None
+        self.throttle = min(10.0, max(self.throttle + 1.0, self.recover_throttle))
+        try:
+            for attempt in range(1, self.recover_attempts + 1):
+                cooldown = random.uniform(self.recover_cooldown_min, self.recover_cooldown_max)
+                print(
+                    f"[warn] Cooling down {cooldown:.1f}s before recovery attempt {attempt}/{self.recover_attempts} "
+                    f"for chapter {idx}..."
+                )
+                time.sleep(cooldown)
+
+                if self.rotate_session_on_failure:
+                    try:
+                        if self.tokens.login_at:
+                            print("[info] Trying session refresh before retry...")
+                            self.refresh()
+                    except Exception as e:
+                        print(f"[warn] Session refresh failed before retry: {e}")
+
+                    try:
+                        if self.email and self.password:
+                            print("[info] Trying full re-login before retry...")
+                            self.login()
+                    except Exception as e:
+                        print(f"[warn] Full re-login failed before retry: {e}")
+
+                retry_res = self.fetch_episode(ep, idx)
+                if retry_res and "error" not in retry_res:
+                    print(f"[info] Recovered chapter {idx} on recovery attempt {attempt}/{self.recover_attempts}.")
+                    return retry_res
+
+                err = retry_res.get("error") if retry_res else "Unknown error"
+                print(f"[warn] Recovery attempt {attempt}/{self.recover_attempts} failed for chapter {idx}: {err}")
+
+            return retry_res if retry_res else {"error": "recovery failed", "idx": idx}
+        finally:
+            self.throttle = old_throttle
+
+
+def describe_http_error(resp: requests.Response) -> str:
+    base = f"{resp.status_code} {resp.reason} for url: {resp.url}"
+    try:
+        data = resp.json()
+    except Exception:
+        body = (resp.text or "").strip()
+        if body:
+            return f"{base} | body: {body[:300]}"
+        return base
+
+    errmsg = data.get("errmsg") or data.get("message")
+    code = data.get("code")
+    result = data.get("result") or {}
+    result_msg = result.get("message") or result.get("name")
+    details = " | ".join(str(x) for x in (errmsg, result_msg, code) if x)
+    if details:
+        return f"{base} | {details}"
+    return base
+
+def request_with_retries(session: requests.Session, method: str, url: str, *,
+                          headers=None, params=None, json=None, data=None,
+                          timeout=30, max_retries=3, backoff=1.25,
+                          allow_refresh=False, refresh_fn=None,
+                          login_fn=None, on_rate_limit=None):
+    """Generic request wrapper: retries on 5xx, 429, and network issues.
+    If allow_refresh is True and the response indicates an expired token, invoke
+    refresh_fn() followed by login_fn() if needed, then retry.
+    """
+    attempt = 0
+    last_exc = None
+    did_refresh = False
+    did_login = False
+    while attempt < max_retries:
+        attempt += 1
+        try:
+            # Inject Cookie header (except for login endpoint) using session cookies
+            try:
+                if "/v1/member/login" not in url:
+                    attach_auth_cookies(session, headers)
+            except Exception as e:
+                print(f"Error occurred while attaching auth cookies: {e}")
+                pass
+
+            if const.HTTP_LOG:
+                print(f"[api]   -> {method} {url} (attempt {attempt}/{max_retries})")
+                try:
+                    eff_headers = {}
+                    try:
+                        eff_headers.update(getattr(session, "headers", {}) or {})
+                    except Exception as e:
+                        print(f"Error occurred while fetching session headers: {e}")
+                        pass
+                    if headers:
+                        eff_headers.update(headers)
+                except Exception as e:
+                    print(f"[api]   req-headers: <unavailable> ({e})")
+                if params:
+                    print(f"[api]   params:  {j(mask_kv(params))}")
+                if json is not None:
+                    print(f"[api]   json:    {j(mask_kv(json))}")
+
+            r = session.request(method, url, headers=headers, params=params, json=json, data=data, timeout=timeout)
+
+            if const.HTTP_LOG and r.status_code != 200:
+                print(f"[api]   <- {r.status_code} {r.reason} from {r.url}")
+                print(f"[api]   <- Response content: {r.text}")
+            
+            # Handle rate limiting (429)
+            if r.status_code == 429:
+                if on_rate_limit:
+                    on_rate_limit()
+                wait = max(5.0, backoff ** (attempt + 2)) + random.uniform(0.5, 1.5)
+                if const.HTTP_LOG:
+                    print(f"[api] !! Rate limit (429) hit. Waiting {wait:.1f}s...")
+                time.sleep(wait)
+                continue
+
+            # Handle too many requests or server errors (5xx)
+            if r.status_code >= 500:
+                if on_rate_limit:
+                    on_rate_limit()
+                wait = max(5.0, backoff ** (attempt + 2)) + random.uniform(0.5, 1.5)
+                if const.HTTP_LOG:
+                    print(f"[api] !! Server error ({r.status_code}). Retrying after backoff...")
+                time.sleep(wait)
+                continue
+
+            # Handle auth refresh-and-retry for all endpoints except login/refresh
+            if allow_refresh and (refresh_fn or login_fn) and not did_login:
+                trigger_refresh = False
+                if r.status_code in (401, 403):
+                    trigger_refresh = True
+                else:
+                    msg = ""
+                    try:
+                        body = r.json()
+                        msg = (body.get("errmsg") or body.get("message") or "").lower()
+                    except Exception:
+                        pass
+                    if "token" in msg and "expire" in msg:
+                        trigger_refresh = True
+
+                if trigger_refresh:
+                    try:
+                        success = False
+                        # Try refresh first
+                        if refresh_fn and not did_refresh:
+                            if const.HTTP_LOG: print("[api] Session expired, trying refresh...")
+                            try:
+                                refresh_fn()
+                                did_refresh = True
+                                success = True
+                            except Exception:
+                                if const.HTTP_LOG: print("[api] Refresh failed.")
+                        
+                        # Try full login if refresh failed or not available
+                        if not success and login_fn and not did_login:
+                            if const.HTTP_LOG: print("[api] Refresh failed or unavailable, trying full re-login...")
+                            try:
+                                login_fn()
+                                did_login = True
+                                success = True
+                            except Exception as e:
+                                if const.HTTP_LOG: print(f"[api] Re-login failed: {e}")
+
+                        if success:
+                            # Retry original request once
+                            r = session.request(method, url, headers=headers, params=params, json=json, data=data, timeout=timeout)
+                    except Exception as e:
+                        if const.HTTP_LOG: print(f"[api] Auth recovery failed: {e}")
+
+            if r.json and r.status_code >= 500 and attempt < max_retries:
+                time.sleep(backoff ** attempt)
+                continue
+            return r
+        except requests.RequestException as e:
+            if const.HTTP_LOG:
+                print(f"[api] !! {method} {url} failed on attempt {attempt}: {e}")
+            last_exc = e
+            if attempt < max_retries:
+                time.sleep(backoff ** attempt)
+                continue
+            raise
+    if last_exc:
+        raise last_exc
+    return r
