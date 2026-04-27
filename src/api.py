@@ -82,9 +82,11 @@ class NovelpiaClient:
 
     def refresh(self) -> Optional[str]:
         url = f"{const.API_BASE}/v1/login/refresh"
+        # /v1/login/refresh works with session cookies alone (USERKEY).
+        # Do NOT send login-at header — if the JWT is expired, the API
+        # will reject the request even though cookies would succeed.
         r = request_with_retries(
             self.s, "GET", url,
-            headers=merge_login_at({}, self.tokens.login_at),
             timeout=self.timeout, max_retries=2,
         )
         r.raise_for_status()
