@@ -25,52 +25,11 @@ class Tokens:
     userkey: Optional[str] = None
 
 
-@dataclass(frozen=True)
-class FetchProfile:
-    name: str
-    max_workers: int
-    periodic_rest_every: int
-    periodic_rest_min: float
-    periodic_rest_max: float
-    recover_attempts: int
-    recover_cooldown_min: float
-    recover_cooldown_max: float
-    recover_throttle: float
-    rotate_session_on_failure: bool
-
-
-FETCH_PROFILES: Dict[str, FetchProfile] = {
-    "safe": FetchProfile(
-        name="safe",
-        max_workers=1,
-        periodic_rest_every=10,
-        periodic_rest_min=45.0,
-        periodic_rest_max=75.0,
-        recover_attempts=3,
-        recover_cooldown_min=15.0,
-        recover_cooldown_max=30.0,
-        recover_throttle=4.0,
-        rotate_session_on_failure=True,
-    ),
-    "fast-rotate": FetchProfile(
-        name="fast-rotate",
-        max_workers=3,
-        periodic_rest_every=0,
-        periodic_rest_min=0.0,
-        periodic_rest_max=0.0,
-        recover_attempts=2,
-        recover_cooldown_min=10.0,
-        recover_cooldown_max=20.0,
-        recover_throttle=3.0,
-        rotate_session_on_failure=True,
-    ),
-}
-
 class NovelpiaClient:
     def __init__(self, email: Optional[str] = None, password: Optional[str] = None,
-                 proxy: Optional[str] = None, timeout: int = 30, throttle: float = 1.5,
+                 proxy: Optional[str] = None, timeout: int = 30, throttle: float = 0.5,
                  userkey: Optional[str] = None, tkey: Optional[str] = None,
-                 fetch_profile: str = "safe"):
+                 threads: int = 1):
         self.s = requests.Session()
         self.s.headers.update(const.SESSION_HEADERS.copy())
         if proxy:
@@ -82,18 +41,12 @@ class NovelpiaClient:
         # delay seconds between episode-related API calls to reduce 429/500 rate limits
         self.throttle = max(0.0, float(throttle or 0.5))
         self.chapter_counter = 0
-        self.fetch_profile_name = "safe"
-        self.fetch_profile = FETCH_PROFILES["safe"]
-        self.rest_every_chapters = 10
-        self.rest_min_seconds = 45.0
-        self.rest_max_seconds = 75.0
-        self.default_max_workers = 1
+        self.default_max_workers = max(1, int(threads or 1))
         self.recover_attempts = 3
-        self.recover_cooldown_min = 180.0
-        self.recover_cooldown_max = 300.0
+        self.recover_cooldown_min = 15.0
+        self.recover_cooldown_max = 30.0
         self.recover_throttle = 4.0
         self.rotate_session_on_failure = True
-        self.set_fetch_profile(fetch_profile)
         try:
             if not userkey:
                 userkey = uuid.uuid4().hex
@@ -105,19 +58,7 @@ class NovelpiaClient:
         except Exception as e:
             print(f"Error setting cookies: {e}")
 
-    def set_fetch_profile(self, profile_name: Optional[str]) -> None:
-        selected = FETCH_PROFILES.get((profile_name or "").strip().lower()) or FETCH_PROFILES["safe"]
-        self.fetch_profile_name = selected.name
-        self.fetch_profile = selected
-        self.rest_every_chapters = selected.periodic_rest_every
-        self.rest_min_seconds = selected.periodic_rest_min
-        self.rest_max_seconds = selected.periodic_rest_max
-        self.default_max_workers = max(1, selected.max_workers)
-        self.recover_attempts = max(1, selected.recover_attempts)
-        self.recover_cooldown_min = max(0.0, selected.recover_cooldown_min)
-        self.recover_cooldown_max = max(self.recover_cooldown_min, selected.recover_cooldown_max)
-        self.recover_throttle = max(0.0, selected.recover_throttle)
-        self.rotate_session_on_failure = bool(selected.rotate_session_on_failure)
+
 
     def login(self):
         url = f"{const.API_BASE}/v1/member/login"
@@ -261,7 +202,6 @@ class NovelpiaClient:
         epi_no = int(episode_no)
         epi_title = ep.get("epi_title") or f"Episode {ep.get('epi_num')}"
         self.chapter_counter += 1
-        self._rest_if_needed(idx, epi_title)
         
         # 1) Ticket
         try:
@@ -318,21 +258,6 @@ class NovelpiaClient:
             "idx": idx,
         }
 
-    def _rest_if_needed(self, idx: int, epi_title: str) -> None:
-        if self.chapter_counter <= 1:
-            return
-        if self.rest_every_chapters <= 0:
-            return
-        if self.chapter_counter % self.rest_every_chapters != 1:
-            return
-
-        wait = random.uniform(self.rest_min_seconds, self.rest_max_seconds)
-        print(
-            f"[info] Cooldown pause: waiting {wait:.1f}s before chapter {idx} ({epi_title}) "
-            f"after {self.rest_every_chapters} chapters."
-        )
-        time.sleep(wait)
-
     def fetch_episodes_parallel(self, ep_list: List[Dict[str, Any]], max_workers: int = 1, progress_cb=None) -> List[Dict[str, Any]]:
         """Fetch multiple episodes using the active fetch profile."""
         worker_count = max(1, int(max_workers or self.default_max_workers or 1))
@@ -355,9 +280,7 @@ class NovelpiaClient:
         return results
 
     def _fetch_episodes_concurrent(self, ep_list: List[Dict[str, Any]], max_workers: int, progress_cb=None) -> List[Dict[str, Any]]:
-        print(
-            f"[info] Using fast profile '{self.fetch_profile_name}' with {max_workers} concurrent workers."
-        )
+        print(f"[info] Fetching with {max_workers} concurrent workers.")
         results: List[Dict[str, Any]] = [{} for _ in range(len(ep_list))]
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_map = {

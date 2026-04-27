@@ -4,7 +4,7 @@ import re
 import sys
 
 from dotenv import load_dotenv
-from src.api import FETCH_PROFILES, NovelpiaClient
+from src.api import NovelpiaClient
 from src.builder import build_epub, build_txt
 from src.chrome_session import load_chrome_novelpia_session
 from src.helper import load_config, save_config
@@ -131,12 +131,7 @@ def main():
     ap.add_argument("--proxy", default=None, help="HTTP/HTTPS proxy, e.g. http://host:port")
     ap.add_argument("--debug", "-v", action="store_true", help="Enable verbose HTTP request/response logs and extra diagnostics")
     ap.add_argument("--throttle", type=float, default=0.5, help="Seconds delay between episode requests (default: 0.5)")
-    ap.add_argument(
-        "--fetch-profile",
-        choices=sorted(FETCH_PROFILES.keys()),
-        default="safe",
-        help="Download strategy profile (default: safe)",
-    )
+    ap.add_argument("--threads", type=int, default=1, help="Number of concurrent download threads (default: 1)")
     ap.add_argument("--txt", "-txt", action="store_true", help="Output plain .txt files per episode instead of EPUB")
     ap.add_argument("--novel-links-file", help="Read novel links/IDs from a text file and download them one by one")
     ap.add_argument("--batch-limit", type=int, default=0, help="Process at most N novels from --novel-links-file (0 = all)")
@@ -213,7 +208,7 @@ def main():
             throttle=args.throttle,
             userkey=session_userkey,
             tkey=session_tkey,
-            fetch_profile=args.fetch_profile,
+            threads=args.threads,
         )
         client.login()
         # Persist/refresh tokens after successful login
@@ -241,7 +236,7 @@ def main():
             throttle=args.throttle,
             userkey=session_userkey,
             tkey=session_tkey,
-            fetch_profile=args.fetch_profile,
+            threads=args.threads,
         )
         client.tokens.login_at = session_login_at
         if args.save_session and (args.login_at or args.userkey or args.tkey or args.chrome_profile):
@@ -257,7 +252,7 @@ def main():
             password=None,
             proxy=args.proxy,
             throttle=args.throttle,
-            fetch_profile=args.fetch_profile,
+            threads=args.threads,
         )
 
     if args.novel_links_file:

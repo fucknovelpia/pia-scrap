@@ -16,7 +16,7 @@ from tkinter import ttk, messagebox
 
 from dotenv import dotenv_values
 
-from src.api import FETCH_PROFILES
+
 from src.chrome_session import list_chrome_profiles, load_chrome_novelpia_session
 from src.helper import load_config, save_config
 
@@ -47,10 +47,8 @@ def launch_ui() -> None:
     out_var = tk.StringVar(value="output")
     txt_var = tk.BooleanVar(value=False)
     batch_links_var = tk.StringVar(value="output/novel_links.txt")
-    saved_fetch_profile = str(cfg.get("fetch_profile") or "safe")
-    if saved_fetch_profile not in FETCH_PROFILES:
-        saved_fetch_profile = "safe"
-    fetch_profile_var = tk.StringVar(value=saved_fetch_profile)
+    threads_var = tk.IntVar(value=int(cfg.get("threads") or 1))
+    interval_var = tk.DoubleVar(value=float(cfg.get("interval") or 0.5))
     scrape_out_var = tk.StringVar(value="output/novel_links.txt")
     page_start_var = tk.StringVar(value="1")
     page_end_var = tk.StringVar(value="63")
@@ -78,7 +76,6 @@ def launch_ui() -> None:
         batch_download_btn.config(state=state)
         scrape_btn.config(state=state)
         profile_combo.config(state=readonly_state)
-        profile_combo_download.config(state=readonly_state)
         cancel_btn.config(state=("normal" if is_busy else "disabled"))
 
     def append_log(text: str) -> None:
@@ -190,7 +187,8 @@ def launch_ui() -> None:
                 "login_at": login_at_var.get().strip(),
                 "userkey": userkey_var.get().strip(),
                 "tkey": tkey_var.get().strip(),
-                "fetch_profile": fetch_profile_var.get().strip() or "safe",
+                "threads": threads_var.get(),
+                "interval": interval_var.get(),
             }
         )
         set_status("Saved session to .api.json.")
@@ -317,14 +315,13 @@ def launch_ui() -> None:
             args += ["--tkey", tkey_var.get().strip()]
         if txt_var.get():
             args.append("--txt")
-        args += ["--fetch-profile", fetch_profile_var.get().strip() or "safe"]
+        args += ["--threads", str(threads_var.get()), "--throttle", str(interval_var.get())]
 
         mode = "TXT" if txt_var.get() else "EPUB"
-        profile_label = fetch_profile_var.get().strip() or "safe"
         run_command(
             args,
             f"Finished downloading novel {novel_id}.",
-            f"Downloading novel {novel_id} as {mode} with profile {profile_label}...",
+            f"Downloading novel {novel_id} as {mode}...",
         )
 
     def run_link_scrape() -> None:
@@ -358,14 +355,13 @@ def launch_ui() -> None:
             args += ["--tkey", tkey_var.get().strip()]
         if txt_var.get():
             args.append("--txt")
-        args += ["--fetch-profile", fetch_profile_var.get().strip() or "safe"]
+        args += ["--threads", str(threads_var.get()), "--throttle", str(interval_var.get())]
 
         mode = "TXT" if txt_var.get() else "EPUB"
-        profile_label = fetch_profile_var.get().strip() or "safe"
         run_command(
             args,
             f"Finished batch download from {links_file}.",
-            f"Batch downloading novels from {links_file} as {mode} with profile {profile_label}...",
+            f"Batch downloading novels from {links_file} as {mode}...",
         )
 
     root.columnconfigure(0, weight=1)
@@ -524,33 +520,34 @@ def launch_ui() -> None:
     ttk.Label(download_tab, text="Batch links file").grid(row=2, column=0, sticky="w", pady=4)
     ttk.Entry(download_tab, textvariable=batch_links_var).grid(row=2, column=1, columnspan=2, sticky="ew", pady=4)
 
-    ttk.Label(download_tab, text="Speed profile").grid(row=3, column=0, sticky="w", pady=4)
-    profile_values = list(sorted(FETCH_PROFILES.keys()))
-    profile_combo_download = ttk.Combobox(
-        download_tab,
-        textvariable=fetch_profile_var,
-        values=profile_values,
-        state="readonly",
-    )
-    profile_combo_download.grid(row=3, column=1, sticky="ew", pady=4)
+    ttk.Label(download_tab, text="Threads").grid(row=3, column=0, sticky="w", pady=4)
+    ttk.Spinbox(download_tab, from_=1, to=10, textvariable=threads_var, width=5).grid(row=3, column=1, sticky="w", pady=4)
     ttk.Label(
         download_tab,
-        text="safe = current conservative mode | fast-rotate = original-style speed with session refresh/re-login on failure",
-        wraplength=420,
+        text="Concurrent download workers (1 = sequential)",
         justify="left",
     ).grid(row=3, column=2, sticky="w", padx=(12, 0), pady=4)
+
+    ttk.Label(download_tab, text="Interval (s)").grid(row=4, column=0, sticky="w", pady=4)
+    ttk.Spinbox(download_tab, from_=0.0, to=10.0, increment=0.1, textvariable=interval_var, width=5, format="%.1f").grid(row=4, column=1, sticky="w", pady=4)
+    ttk.Label(
+        download_tab,
+        text="Delay between requests in seconds (0.5 recommended)",
+        justify="left",
+    ).grid(row=4, column=2, sticky="w", padx=(12, 0), pady=4)
+
     ttk.Button(
         download_tab,
-        text="Save Profile",
+        text="Save Settings",
         command=save_session_to_config,
-    ).grid(row=4, column=0, sticky="w", pady=(12, 0))
+    ).grid(row=5, column=0, sticky="w", pady=(12, 0))
 
     cancel_btn = ttk.Button(download_tab, text="Cancel", command=cancel_run, state="disabled")
-    cancel_btn.grid(row=4, column=1, sticky="e", pady=(12, 0))
+    cancel_btn.grid(row=5, column=1, sticky="e", pady=(12, 0))
     batch_download_btn = ttk.Button(download_tab, text="Run Batch Download", command=run_batch_download)
-    batch_download_btn.grid(row=4, column=2, sticky="w", pady=(12, 0))
+    batch_download_btn.grid(row=5, column=2, sticky="w", pady=(12, 0))
     download_btn = ttk.Button(download_tab, text="Run Download", command=run_download)
-    download_btn.grid(row=4, column=2, sticky="e", pady=(12, 0))
+    download_btn.grid(row=5, column=2, sticky="e", pady=(12, 0))
 
     ttk.Label(scrape_tab, text="Page start").grid(row=0, column=0, sticky="w", pady=4)
     ttk.Entry(scrape_tab, textvariable=page_start_var).grid(row=0, column=1, sticky="ew", pady=4)
