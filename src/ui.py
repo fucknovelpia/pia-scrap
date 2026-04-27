@@ -18,14 +18,19 @@ from dotenv import dotenv_values
 
 
 from src.chrome_session import list_chrome_profiles, load_chrome_novelpia_session
+from src.const import APP_DIR
 from src.helper import load_config, save_config
 
 CHROME_BINARY = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
-LOG_DIR = Path(__file__).resolve().parent.parent / "output" / "logs"
+ENV_PATH = APP_DIR / ".env"
+LOG_DIR = APP_DIR / "output" / "logs"
 
 
 def launch_ui() -> None:
+    # When frozen, ensure CWD is the exe's directory (not the temp extraction dir)
+    if getattr(sys, 'frozen', False):
+        os.chdir(Path(sys.executable).parent)
+
     root = tk.Tk()
     root.title("PIA Scrap")
     root.geometry("900x700")
@@ -59,6 +64,8 @@ def launch_ui() -> None:
     auto_import_after_login = tk.BooleanVar(value=False)
     current_log_path: Path | None = None
     was_cancelled = False
+    cancel_event = threading.Event()
+    worker_thread: threading.Thread | None = None
 
     def set_status(text: str) -> None:
         status_var.set(text)
@@ -249,7 +256,10 @@ def launch_ui() -> None:
                         writer = QueueWriter(log_queue, logf)
                         old_stdout, old_stderr = sys.stdout, sys.stderr
                         old_argv = sys.argv
+                        old_cwd = os.getcwd()
                         try:
+                            # CWD must be the exe's directory for .api.json, output/, etc.
+                            os.chdir(Path(sys.executable).parent)
                             sys.stdout = writer
                             sys.stderr = writer
                             sys.argv = ["PIA-Scrap.exe", *args]
@@ -259,6 +269,8 @@ def launch_ui() -> None:
                         except SystemExit as e:
                             code = e.code if isinstance(e.code, int) else 1
                             root.after(0, lambda: finish_run(code, "", success_message))
+                        except KeyboardInterrupt:
+                            root.after(0, lambda: finish_run(1, "", success_message))
                         except Exception as e:
                             import traceback
                             err = traceback.format_exc()
@@ -268,6 +280,7 @@ def launch_ui() -> None:
                             sys.stdout = old_stdout
                             sys.stderr = old_stderr
                             sys.argv = old_argv
+                            os.chdir(old_cwd)
                 else:
                     # Source mode: spawn subprocess as before
                     env = dict(**__import__("os").environ)
@@ -309,6 +322,12 @@ def launch_ui() -> None:
                 current_process = None
 
         set_busy(True)
+        cancel_event.clear()
+        try:
+            from src.api import cancel_event as api_cancel
+            api_cancel.clear()
+        except Exception:
+            pass
         set_status(running_message)
         clear_log()
         cmd_display = f"python main.py {' '.join(args)}"
@@ -342,18 +361,23 @@ def launch_ui() -> None:
 
     def cancel_run() -> None:
         nonlocal current_process, was_cancelled
-        proc = current_process
-        if not proc or proc.poll() is not None:
-            set_status("No running command to cancel.")
-            return
+        if was_cancelled:
+            return  # already cancelling
+        was_cancelled = True
+        cancel_event.set()
         try:
-            was_cancelled = True
-            proc.terminate()
-            append_log("\n[ui] Cancel requested. Terminating running command...\n")
-            set_status("Cancelling...")
-        except Exception as e:
-            was_cancelled = False
-            messagebox.showerror("Cancel failed", str(e))
+            from src.api import cancel_event as api_cancel
+            api_cancel.set()
+        except Exception:
+            pass
+        proc = current_process
+        if proc and proc.poll() is None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+        append_log("\n[ui] Cancel requested. Stopping...\n")
+        set_status("Cancelling...")
 
     def run_download() -> None:
         novel_id = novel_id_var.get().strip()
@@ -636,6 +660,20 @@ def launch_ui() -> None:
     log_scroll.grid(row=1, column=1, sticky="ns")
     log_text.configure(yscrollcommand=log_scroll.set)
 
+    def on_close():
+        """Clean shutdown: cancel any running work, then force-exit."""
+        cancel_event.set()
+        try:
+            from src.api import cancel_event as api_cancel
+            api_cancel.set()
+        except Exception:
+            pass
+        root.destroy()
+        # Force exit to prevent PyInstaller temp dir cleanup warnings
+        import os
+        os._exit(0)
+
+    root.protocol("WM_DELETE_WINDOW", on_close)
     root.after(120, poll_log_queue)
     root.bind("<FocusIn>", on_focus_in)
 

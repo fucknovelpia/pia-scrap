@@ -2,6 +2,7 @@ import json
 import os
 import random
 import time
+import threading
 import uuid
 import requests
 import concurrent.futures
@@ -17,6 +18,9 @@ from src.novel import html_from_episode_text
 # ----------------------------
 # API Client
 # ----------------------------
+
+# Module-level cancel event — set by the UI to stop downloads
+cancel_event = threading.Event()
 
 @dataclass
 class Tokens:
@@ -207,6 +211,9 @@ class NovelpiaClient:
         epi_no = int(episode_no)
         epi_title = ep.get("epi_title") or f"Episode {ep.get('epi_num')}"
         self.chapter_counter += 1
+
+        if cancel_event.is_set():
+            return {"error": "cancelled", "epi_no": epi_no, "epi_title": epi_title, "idx": idx}
         
         # 1) Ticket
         try:
@@ -217,6 +224,9 @@ class NovelpiaClient:
         token_t, direct_url = extract_t_token(tdata)
         if not token_t and not direct_url:
             return {"error": "no token found", "epi_no": epi_no, "epi_title": epi_title, "idx": idx}
+
+        if cancel_event.is_set():
+            return {"error": "cancelled", "epi_no": epi_no, "epi_title": epi_title, "idx": idx}
 
         # 2) Content
         try:
@@ -318,6 +328,11 @@ class NovelpiaClient:
 
                 # Wait for batch to complete
                 for future in concurrent.futures.as_completed(future_map):
+                    if cancel_event.is_set():
+                        # Cancel remaining futures
+                        for f in future_map:
+                            f.cancel()
+                        raise KeyboardInterrupt("Cancelled by user")
                     idx, ep = future_map[future]
                     try:
                         res = future.result()
@@ -325,11 +340,13 @@ class NovelpiaClient:
                         res = {"error": str(e), "idx": idx}
 
                     if (not res) or ("error" in res):
+                        if cancel_event.is_set():
+                            raise KeyboardInterrupt("Cancelled by user")
                         err = res.get("error") if res else "Unknown error"
                         print(f"[warn] Chapter {idx} failed: {err}")
-                        self.throttle = saved_throttle  # restore for recovery
+                        self.throttle = saved_throttle
                         res = self._recover_episode(ep, idx)
-                        self.throttle = 0  # back to batch mode
+                        self.throttle = 0
 
                     results[idx - 1] = res
                     if progress_cb:
@@ -339,6 +356,11 @@ class NovelpiaClient:
                 batch_elapsed = time.time() - batch_t0
                 print(f"[batch {batch_num}/{num_batches}] Done in {batch_elapsed:.1f}s")
 
+                # Check for cancellation
+                if cancel_event.is_set():
+                    print("[info] Download cancelled by user.")
+                    raise KeyboardInterrupt("Cancelled by user")
+
                 # Throttle between batches
                 if batch_start + max_workers < total:
                     time.sleep(saved_throttle)
@@ -347,17 +369,25 @@ class NovelpiaClient:
         return results
 
     def _recover_episode(self, ep: Dict[str, Any], idx: int) -> Dict[str, Any]:
+        if cancel_event.is_set():
+            return {"error": "cancelled", "idx": idx}
         old_throttle = self.throttle
         retry_res: Optional[Dict[str, Any]] = None
         self.throttle = min(10.0, max(self.throttle + 1.0, self.recover_throttle))
         try:
             for attempt in range(1, self.recover_attempts + 1):
+                if cancel_event.is_set():
+                    return {"error": "cancelled", "idx": idx}
                 cooldown = random.uniform(self.recover_cooldown_min, self.recover_cooldown_max)
                 print(
                     f"[warn] Cooling down {cooldown:.1f}s before recovery attempt {attempt}/{self.recover_attempts} "
                     f"for chapter {idx}..."
                 )
-                time.sleep(cooldown)
+                # Sleep in small increments so cancel is responsive
+                for _ in range(int(cooldown * 10)):
+                    if cancel_event.is_set():
+                        return {"error": "cancelled", "idx": idx}
+                    time.sleep(0.1)
 
                 if self.rotate_session_on_failure:
                     try:
@@ -421,6 +451,8 @@ def request_with_retries(session: requests.Session, method: str, url: str, *,
     did_login = False
     while attempt < max_retries:
         attempt += 1
+        if cancel_event.is_set():
+            raise requests.RequestException("Cancelled by user")
         try:
             # Inject Cookie header (except for login endpoint) using session cookies
             try:

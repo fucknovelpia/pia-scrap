@@ -1,14 +1,23 @@
 from pathlib import Path
+import sys
 
 # ----------------------------
 # Constants
 # ----------------------------
 
+# Resolve the application root directory:
+# - Frozen (PyInstaller): directory containing the .exe
+# - Source: project root (parent of src/)
+if getattr(sys, 'frozen', False):
+    APP_DIR = Path(sys.executable).resolve().parent
+else:
+    APP_DIR = Path(__file__).resolve().parent.parent
+
 BASE_URL = "https://global.novelpia.com"
 API_BASE = "https://api-global.novelpia.com"
 IMG_BASE_HTTPS = "https:"
 HTTP_LOG = False 
-CONFIG_PATH = Path(__file__).resolve().parent.parent / ".api.json"
+CONFIG_PATH = APP_DIR / ".api.json"
 
 SESSION_HEADERS = {
     "accept": "application/json, text/plain, */*",

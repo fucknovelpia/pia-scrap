@@ -14,7 +14,8 @@ LOGIN_URL = "https://global.novelpia.com/"
 
 
 def _run_webview_login(output_path: str) -> None:
-    log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "output", "logs")
+    from src.const import APP_DIR
+    log_dir = os.path.join(str(APP_DIR), "output", "logs")
     os.makedirs(log_dir, exist_ok=True)
     debug_path = os.path.join(log_dir, "webview_debug.log")
 
@@ -204,8 +205,8 @@ def _run_webview_login(output_path: str) -> None:
     except Exception:
         _sw, _sh = 1200, 900
 
-    # Persistent storage — keeps Google login cookies between sessions
-    storage_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".webview_data")
+    # Persistent storage -- keeps Google login cookies between sessions
+    storage_dir = os.path.join(str(APP_DIR), ".webview_data")
     os.makedirs(storage_dir, exist_ok=True)
     _dbg(f"Storage path: {storage_dir}")
 
