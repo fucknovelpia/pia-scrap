@@ -58,6 +58,7 @@ def launch_ui() -> None:
     current_process: subprocess.Popen[str] | None = None
     auto_import_after_login = tk.BooleanVar(value=False)
     current_log_path: Path | None = None
+    was_cancelled = False
 
     def set_status(text: str) -> None:
         status_var.set(text)
@@ -261,14 +262,16 @@ def launch_ui() -> None:
         threading.Thread(target=worker, daemon=True).start()
 
     def finish_run(returncode: int, output: str, success_message: str) -> None:
+        nonlocal was_cancelled
         set_busy(False)
         output = (output or "").strip()
-        if returncode == -15:
-            msg = "Command cancelled."
+        # Handle user cancellation (Windows terminate() returns 1, Unix returns -15)
+        if was_cancelled:
+            was_cancelled = False
+            msg = "Download cancelled by user."
             if current_log_path:
-                msg += f" Log: {current_log_path}"
+                msg += f"\nLog: {current_log_path}"
             set_status(msg)
-            messagebox.showinfo("Cancelled", msg)
             return
         if returncode == 0:
             msg = summarize_output(output, success_message)
@@ -284,16 +287,18 @@ def launch_ui() -> None:
             messagebox.showerror("Run failed", msg)
 
     def cancel_run() -> None:
-        nonlocal current_process
+        nonlocal current_process, was_cancelled
         proc = current_process
         if not proc or proc.poll() is not None:
             set_status("No running command to cancel.")
             return
         try:
+            was_cancelled = True
             proc.terminate()
             append_log("\n[ui] Cancel requested. Terminating running command...\n")
-            set_status("Cancelling command...")
+            set_status("Cancelling...")
         except Exception as e:
+            was_cancelled = False
             messagebox.showerror("Cancel failed", str(e))
 
     def run_download() -> None:
@@ -301,6 +306,15 @@ def launch_ui() -> None:
         if not novel_id:
             messagebox.showerror("Download", "Please enter a novel ID.")
             return
+
+        # Auto-save settings so they persist across sessions
+        save_config({
+            "login_at": login_at_var.get().strip(),
+            "userkey": userkey_var.get().strip(),
+            "tkey": tkey_var.get().strip(),
+            "threads": threads_var.get(),
+            "interval": interval_var.get(),
+        })
 
         args = [novel_id, "--out", out_var.get().strip() or "output"]
         if email_var.get().strip():

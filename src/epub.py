@@ -208,7 +208,7 @@ class EpubBuilder:
 
         fetched_results = []
         if episodes_to_fetch:
-            fetched_results = client.fetch_episodes_parallel(episodes_to_fetch, progress_cb=update_pbar)
+            fetched_results = client.fetch_episodes_parallel(episodes_to_fetch, max_workers=client.default_max_workers, progress_cb=update_pbar)
 
         fetched_map: Dict[int, Dict] = {}
         if book_dir:

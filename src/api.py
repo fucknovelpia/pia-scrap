@@ -282,29 +282,56 @@ class NovelpiaClient:
         return results
 
     def _fetch_episodes_concurrent(self, ep_list: List[Dict[str, Any]], max_workers: int, progress_cb=None) -> List[Dict[str, Any]]:
-        print(f"[info] Fetching with {max_workers} concurrent workers.")
+        """Fetch episodes in batches of max_workers, like NpiaDownloader67.
+
+        Each batch submits max_workers chapters simultaneously with no
+        per-request throttle inside the batch. The throttle delay is applied
+        between batches instead, preventing rate limits while maximising
+        throughput.
+        """
+        print(f"[info] Fetching with {max_workers} concurrent workers, {self.throttle}s delay between batches.")
         results: List[Dict[str, Any]] = [{} for _ in range(len(ep_list))]
+
+        # Temporarily disable per-request throttle since we throttle between batches
+        saved_throttle = self.throttle
+
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_map = {
-                executor.submit(self.fetch_episode, ep, idx): (idx, ep)
-                for idx, ep in enumerate(ep_list, 1)
-            }
-            for future in concurrent.futures.as_completed(future_map):
-                idx, ep = future_map[future]
-                try:
-                    res = future.result()
-                except Exception as e:
-                    res = {"error": str(e), "idx": idx}
+            for batch_start in range(0, len(ep_list), max_workers):
+                batch = ep_list[batch_start:batch_start + max_workers]
+                batch_indices = list(range(batch_start, batch_start + len(batch)))
 
-                if (not res) or ("error" in res):
-                    err = res.get("error") if res else "Unknown error"
-                    print(f"[warn] Chapter {idx} failed on initial fast attempt: {err}")
-                    res = self._recover_episode(ep, idx)
+                # Submit batch — no throttle inside batch for true parallelism
+                self.throttle = 0
+                future_map = {}
+                for i, ep in zip(batch_indices, batch):
+                    idx = i + 1  # 1-based
+                    future_map[executor.submit(self.fetch_episode, ep, idx)] = (idx, ep)
 
-                results[idx - 1] = res
-                if progress_cb:
-                    ok = bool(res) and "error" not in res
-                    progress_cb(idx, ok)
+                # Wait for batch to complete
+                for future in concurrent.futures.as_completed(future_map):
+                    idx, ep = future_map[future]
+                    try:
+                        res = future.result()
+                    except Exception as e:
+                        res = {"error": str(e), "idx": idx}
+
+                    if (not res) or ("error" in res):
+                        err = res.get("error") if res else "Unknown error"
+                        print(f"[warn] Chapter {idx} failed on initial attempt: {err}")
+                        self.throttle = saved_throttle  # restore for recovery
+                        res = self._recover_episode(ep, idx)
+                        self.throttle = 0  # back to batch mode
+
+                    results[idx - 1] = res
+                    if progress_cb:
+                        ok = bool(res) and "error" not in res
+                        progress_cb(idx, ok)
+
+                # Throttle between batches
+                if batch_start + max_workers < len(ep_list):
+                    time.sleep(saved_throttle)
+
+        self.throttle = saved_throttle
         return results
 
     def _recover_episode(self, ep: Dict[str, Any], idx: int) -> Dict[str, Any]:

@@ -188,7 +188,7 @@ def build_txt(client, novel_id, out_dir, start_chapter=None, end_chapter=None, m
 
     fetched_results = []
     if episodes_to_fetch:
-        fetched_results = client.fetch_episodes_parallel(episodes_to_fetch, progress_cb=update_pbar)
+        fetched_results = client.fetch_episodes_parallel(episodes_to_fetch, max_workers=client.default_max_workers, progress_cb=update_pbar)
     fetched_map = {int(ep.get("episode_no")): res for ep, res in zip(episodes_to_fetch, fetched_results)}
 
     for i, ep in enumerate(ep_list, 1):
