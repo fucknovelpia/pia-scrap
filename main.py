@@ -145,7 +145,8 @@ def main():
 
     const.HTTP_LOG = bool(args.debug)
 
-    if args.ui:
+    # Default to UI when no arguments given (e.g. double-clicking the .exe)
+    if args.ui or (not args.novel_id and not args.scrape_novel_links and not args.novel_links_file):
         launch_ui()
         return
 
