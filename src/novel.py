@@ -62,7 +62,7 @@ def fetch_novel_and_episodes(client, novel_id, start_chapter=None, end_chapter=N
         except Exception as e:
             print(f"[warn] Could not verify token: {e}")
 
-    print("[info] extracting metadata…")
+    print("[info] extracting metadata...")
     data_novel = client.novel(novel_id)
 
     nv = data_novel["result"]["novel"]

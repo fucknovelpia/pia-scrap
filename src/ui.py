@@ -221,36 +221,89 @@ def launch_ui() -> None:
         def worker() -> None:
             nonlocal current_process, current_log_path
             try:
-                env = dict(**__import__("os").environ)
-                env["PYTHONUNBUFFERED"] = "1"
                 LOG_DIR.mkdir(parents=True, exist_ok=True)
                 action = "scrape" if "--scrape-novel-links" in args else "batch-download" if "--novel-links-file" in args else "download"
                 ts = datetime.now().strftime("%Y%m%d-%H%M%S")
                 current_log_path = LOG_DIR / f"{action}-{ts}.log"
-                proc = subprocess.Popen(
-                    [sys.executable, "main.py", *args],
-                    text=True,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    cwd=Path(__file__).resolve().parent.parent,
-                    bufsize=1,
-                    env=env,
-                )
-                current_process = proc
-                output_parts: list[str] = []
-                assert proc.stdout is not None
-                with current_log_path.open("w", encoding="utf-8") as logf:
-                    logf.write(f"$ {' '.join(['python', 'main.py', *args])}\n\n")
-                    for raw_line in proc.stdout:
-                        line = raw_line.replace("\r", "\n")
-                        output_parts.append(line)
-                        logf.write(line)
-                        logf.flush()
-                        log_queue.put(line)
-                proc.wait()
-                output = "".join(output_parts)
-                root.after(0, lambda: finish_run(proc.returncode or 0, output, success_message))
+
+                if getattr(sys, 'frozen', False):
+                    # Frozen exe: run main() in-process with stdout redirected
+                    import io
+
+                    class QueueWriter(io.TextIOBase):
+                        """Redirect stdout/stderr to the UI log queue and log file."""
+                        def __init__(self, queue, logf):
+                            self._queue = queue
+                            self._logf = logf
+                        def write(self, s):
+                            if s:
+                                self._queue.put(s)
+                                self._logf.write(s)
+                                self._logf.flush()
+                            return len(s) if s else 0
+                        def flush(self):
+                            pass
+
+                    with current_log_path.open("w", encoding="utf-8") as logf:
+                        logf.write(f"$ PIA-Scrap.exe {' '.join(args)}\n\n")
+                        writer = QueueWriter(log_queue, logf)
+                        old_stdout, old_stderr = sys.stdout, sys.stderr
+                        old_argv = sys.argv
+                        try:
+                            sys.stdout = writer
+                            sys.stderr = writer
+                            sys.argv = ["PIA-Scrap.exe", *args]
+                            from main import main as _main
+                            _main()
+                            root.after(0, lambda: finish_run(0, "", success_message))
+                        except SystemExit as e:
+                            code = e.code if isinstance(e.code, int) else 1
+                            root.after(0, lambda: finish_run(code, "", success_message))
+                        except Exception as e:
+                            import traceback
+                            err = traceback.format_exc()
+                            writer.write(f"\n[error] {err}\n")
+                            root.after(0, lambda: finish_run(1, str(e), success_message))
+                        finally:
+                            sys.stdout = old_stdout
+                            sys.stderr = old_stderr
+                            sys.argv = old_argv
+                else:
+                    # Source mode: spawn subprocess as before
+                    env = dict(**__import__("os").environ)
+                    env["PYTHONUNBUFFERED"] = "1"
+                    env["PYTHONIOENCODING"] = "utf-8"
+                    cmd = [sys.executable, "main.py", *args]
+                    popen_kwargs = dict(
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        stdin=subprocess.DEVNULL,
+                        cwd=Path(__file__).resolve().parent.parent,
+                        bufsize=1,
+                        env=env,
+                    )
+                    proc = subprocess.Popen(cmd, **popen_kwargs)
+                    current_process = proc
+                    output_parts: list[str] = []
+                    assert proc.stdout is not None
+                    with current_log_path.open("w", encoding="utf-8") as logf:
+                        logf.write(f"$ {' '.join(cmd)}\n\n")
+                        for raw_line in proc.stdout:
+                            line = raw_line.replace("\r", "\n")
+                            output_parts.append(line)
+                            logf.write(line)
+                            logf.flush()
+                            log_queue.put(line)
+                    proc.wait()
+                    output = "".join(output_parts)
+                    root.after(0, lambda: finish_run(proc.returncode or 0, output, success_message))
             except Exception as e:
+                import traceback
+                err_msg = f"[error] Failed: {e}\n{traceback.format_exc()}\n"
+                log_queue.put(err_msg)
                 root.after(0, lambda: finish_run(1, str(e), success_message))
             finally:
                 current_process = None
@@ -258,7 +311,8 @@ def launch_ui() -> None:
         set_busy(True)
         set_status(running_message)
         clear_log()
-        append_log(f"$ {' '.join(['python', 'main.py', *args])}\n\n")
+        cmd_display = f"python main.py {' '.join(args)}"
+        append_log(f"$ {cmd_display}\n\n")
         threading.Thread(target=worker, daemon=True).start()
 
     def finish_run(returncode: int, output: str, success_message: str) -> None:
