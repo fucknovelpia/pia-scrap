@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import json
+import multiprocessing
+import os
 import subprocess
 import sys
+import tempfile
 import threading
+import time
 import tkinter as tk
 from datetime import datetime
 from pathlib import Path
@@ -404,38 +409,108 @@ def launch_ui() -> None:
 
     ttk.Separator(creds_tab).grid(row=3, column=0, columnspan=3, sticky="ew", pady=(4, 12))
 
-    ttk.Label(creds_tab, text="Chrome profile").grid(row=4, column=0, sticky="w", pady=4)
+    # --- Login with Google (webview) ---
+    def google_login() -> None:
+        """Launch embedded webview for Google OAuth login."""
+        from src.webview_login import _run_webview_login
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".loginkey", mode="w") as tmp:
+            key_path = tmp.name
+
+        def poll_result():
+            for _ in range(900):
+                try:
+                    if os.path.exists(key_path) and os.path.getsize(key_path) > 2:
+                        with open(key_path, "r", encoding="utf-8") as f:
+                            data = json.load(f)
+                        login_at = (data.get("login_at") or "").strip()
+                        userkey = (data.get("userkey") or "").strip()
+                        tkey = (data.get("tkey") or "").strip()
+                        if login_at:
+                            login_at_var.set(login_at)
+                            if userkey:
+                                userkey_var.set(userkey)
+                            if tkey:
+                                tkey_var.set(tkey)
+                            set_status("Google login: session captured successfully.")
+                            append_log("[auth] Google login: login-at token captured.\n")
+                            save_config({
+                                "login_at": login_at,
+                                "userkey": userkey,
+                                "tkey": tkey,
+                            })
+                            try:
+                                os.remove(key_path)
+                            except Exception:
+                                pass
+                            return
+                except Exception:
+                    pass
+                time.sleep(1)
+            set_status("Google login: session not captured (timed out).")
+            append_log("[auth] Google login: timed out waiting for token.\n")
+
+        try:
+            import webview
+            if not hasattr(webview, 'create_window'):
+                raise ImportError("wrong webview module")
+        except Exception as _wv_err:
+            messagebox.showerror(
+                "Missing Dependency",
+                f"pywebview could not be loaded:\n\n{_wv_err}\n\n"
+                "Run: pip install pywebview pythonnet"
+            )
+            return
+
+        try:
+            proc = multiprocessing.Process(target=_run_webview_login, args=(key_path,), daemon=True)
+            proc.start()
+            append_log(f"[auth] Webview process started (PID: {proc.pid}).\n")
+        except Exception as e:
+            messagebox.showerror("Google Login Failed", f"Could not start webview process:\n\n{e}")
+            return
+
+        set_status("Google login: browser opened. Log in with your Google account...")
+        append_log("[auth] Opening Novelpia Global login browser...\n")
+        threading.Thread(target=poll_result, daemon=True).start()
+
+    google_login_btn = ttk.Button(creds_tab, text="Login with Google", command=google_login)
+    google_login_btn.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(0, 12))
+
+    ttk.Separator(creds_tab).grid(row=5, column=0, columnspan=3, sticky="ew", pady=(4, 12))
+
+    ttk.Label(creds_tab, text="Chrome profile").grid(row=6, column=0, sticky="w", pady=4)
     profile_combo = ttk.Combobox(creds_tab, textvariable=profile_var, values=chrome_profiles, state="readonly")
-    profile_combo.grid(row=4, column=1, sticky="ew", pady=4)
+    profile_combo.grid(row=6, column=1, sticky="ew", pady=4)
     import_btn = ttk.Button(creds_tab, text="Import From Chrome", command=import_from_chrome)
-    import_btn.grid(row=4, column=2, sticky="ew", padx=(12, 0), pady=4)
+    import_btn.grid(row=6, column=2, sticky="ew", padx=(12, 0), pady=4)
     login_import_btn = ttk.Button(creds_tab, text="Login In Chrome And Import", command=open_chrome_login_and_import)
-    login_import_btn.grid(row=5, column=1, sticky="ew", pady=4)
+    login_import_btn.grid(row=7, column=1, sticky="ew", pady=4)
     login_btn = ttk.Button(creds_tab, text="Open Chrome Login", command=lambda: open_chrome_login(auto_import=False))
-    login_btn.grid(row=5, column=2, sticky="ew", padx=(12, 0), pady=4)
+    login_btn.grid(row=7, column=2, sticky="ew", padx=(12, 0), pady=4)
 
-    ttk.Label(creds_tab, text="login-at").grid(row=6, column=0, sticky="w", pady=4)
-    ttk.Entry(creds_tab, textvariable=login_at_var).grid(row=6, column=1, columnspan=2, sticky="ew", pady=4)
+    ttk.Label(creds_tab, text="login-at").grid(row=8, column=0, sticky="w", pady=4)
+    ttk.Entry(creds_tab, textvariable=login_at_var).grid(row=8, column=1, columnspan=2, sticky="ew", pady=4)
 
-    ttk.Label(creds_tab, text="USERKEY").grid(row=7, column=0, sticky="w", pady=4)
-    ttk.Entry(creds_tab, textvariable=userkey_var).grid(row=7, column=1, columnspan=2, sticky="ew", pady=4)
+    ttk.Label(creds_tab, text="USERKEY").grid(row=9, column=0, sticky="w", pady=4)
+    ttk.Entry(creds_tab, textvariable=userkey_var).grid(row=9, column=1, columnspan=2, sticky="ew", pady=4)
 
-    ttk.Label(creds_tab, text="TKEY").grid(row=8, column=0, sticky="w", pady=4)
-    ttk.Entry(creds_tab, textvariable=tkey_var).grid(row=8, column=1, columnspan=2, sticky="ew", pady=4)
+    ttk.Label(creds_tab, text="TKEY").grid(row=10, column=0, sticky="w", pady=4)
+    ttk.Entry(creds_tab, textvariable=tkey_var).grid(row=10, column=1, columnspan=2, sticky="ew", pady=4)
 
-    ttk.Label(creds_tab, text="LOGINKEY").grid(row=9, column=0, sticky="w", pady=4)
+    ttk.Label(creds_tab, text="LOGINKEY").grid(row=11, column=0, sticky="w", pady=4)
     ttk.Entry(creds_tab, textvariable=login_key_var, state="readonly").grid(
-        row=9, column=1, columnspan=2, sticky="ew", pady=4
+        row=11, column=1, columnspan=2, sticky="ew", pady=4
     )
     save_btn = ttk.Button(creds_tab, text="Save Session", command=save_session_to_config)
-    save_btn.grid(row=10, column=2, sticky="e", pady=(8, 0))
+    save_btn.grid(row=12, column=2, sticky="e", pady=(8, 0))
 
     ttk.Label(
         creds_tab,
-        text="Email/password are used first. Imported browser session is optional.",
+        text="Email/password are used first. Google login or imported browser session is optional.",
         wraplength=760,
         justify="left",
-    ).grid(row=11, column=0, columnspan=3, sticky="w", pady=(12, 0))
+    ).grid(row=13, column=0, columnspan=3, sticky="w", pady=(12, 0))
 
     ttk.Label(download_tab, text="Novel ID").grid(row=0, column=0, sticky="w", pady=4)
     ttk.Entry(download_tab, textvariable=novel_id_var).grid(row=0, column=1, sticky="ew", pady=4)

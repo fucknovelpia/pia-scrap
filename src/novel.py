@@ -33,14 +33,15 @@ def html_from_episode_text(raw_html: str) -> str:
     return str(soup)
 
 def fetch_novel_and_episodes(client, novel_id, start_chapter=None, end_chapter=None, max_chapters=None):
-    # Auth check
-    try:
-        res = client.me()
-        if str(res.get("statusCode")) == "200":
-            mem = (((res.get("result") or {}).get("login") or {}).get("mem_nick")) or "Unknown"
-            print(f"[auth] Logged in as: {mem}")
-    except Exception:
-        pass
+    # Auth check — only if we have a session token
+    if client.tokens.login_at:
+        try:
+            res = client.me()
+            if str(res.get("statusCode")) == "200":
+                mem = (((res.get("result") or {}).get("login") or {}).get("mem_nick")) or "Unknown"
+                print(f"[auth] Logged in as: {mem}")
+        except Exception:
+            pass
 
     print("[info] extracting metadata…")
     data_novel = client.novel(novel_id)

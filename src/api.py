@@ -47,8 +47,8 @@ FETCH_PROFILES: Dict[str, FetchProfile] = {
         periodic_rest_min=45.0,
         periodic_rest_max=75.0,
         recover_attempts=3,
-        recover_cooldown_min=180.0,
-        recover_cooldown_max=300.0,
+        recover_cooldown_min=15.0,
+        recover_cooldown_max=30.0,
         recover_throttle=4.0,
         rotate_session_on_failure=True,
     ),
@@ -59,8 +59,8 @@ FETCH_PROFILES: Dict[str, FetchProfile] = {
         periodic_rest_min=0.0,
         periodic_rest_max=0.0,
         recover_attempts=2,
-        recover_cooldown_min=20.0,
-        recover_cooldown_max=45.0,
+        recover_cooldown_min=10.0,
+        recover_cooldown_max=20.0,
         recover_throttle=3.0,
         rotate_session_on_failure=True,
     ),
@@ -80,7 +80,7 @@ class NovelpiaClient:
         self.email = email
         self.password = password
         # delay seconds between episode-related API calls to reduce 429/500 rate limits
-        self.throttle = max(0.0, float(throttle or 1.5))
+        self.throttle = max(0.0, float(throttle or 0.5))
         self.chapter_counter = 0
         self.fetch_profile_name = "safe"
         self.fetch_profile = FETCH_PROFILES["safe"]
@@ -188,12 +188,14 @@ class NovelpiaClient:
 
     def novel(self, novel_id: int) -> Dict:
         url = f"{const.API_BASE}/v1/novel"
+        has_auth = bool(self.tokens.login_at or self.email)
         r = request_with_retries(
             self.s, "GET", url,
             headers=merge_login_at({}, self.tokens.login_at),
             params={"novel_no": novel_id},
-            timeout=self.timeout, allow_refresh=True, 
-            refresh_fn=self.refresh, login_fn=self.login,
+            timeout=self.timeout, allow_refresh=has_auth, 
+            refresh_fn=self.refresh if has_auth else None,
+            login_fn=self.login if has_auth else None,
             on_rate_limit=self._on_rate_limit
         )
         r.raise_for_status()
@@ -201,12 +203,14 @@ class NovelpiaClient:
 
     def episode_list(self, novel_id: int, rows: int) -> Dict:
         url = f"{const.API_BASE}/v1/novel/episode/list"
+        has_auth = bool(self.tokens.login_at or self.email)
         r = request_with_retries(
             self.s, "GET", url,
             headers=merge_login_at({}, self.tokens.login_at),
             params={"novel_no": novel_id, "rows": rows, "sort": "ASC"},
-            timeout=self.timeout, allow_refresh=True, 
-            refresh_fn=self.refresh, login_fn=self.login,
+            timeout=self.timeout, allow_refresh=has_auth, 
+            refresh_fn=self.refresh if has_auth else None,
+            login_fn=self.login if has_auth else None,
             on_rate_limit=self._on_rate_limit
         )
         r.raise_for_status()
@@ -218,7 +222,7 @@ class NovelpiaClient:
         params = {"episode_no": episode_no}
         # Throttle before hitting ticket endpoint to avoid rate limits
         if self.throttle:
-            time.sleep(self.throttle + random.uniform(1.0, 1.5))
+            time.sleep(self.throttle)
         r = request_with_retries(
             self.s, "GET", url,
             headers=headers, params=params,
@@ -232,9 +236,7 @@ class NovelpiaClient:
 
     def episode_content(self, token_t: str) -> Dict:
         url = f"{const.API_BASE}/v1/novel/episode/content"
-        # Throttle content fetch too, to be safe
-        if self.throttle:
-            time.sleep(self.throttle + random.uniform(1.0, 1.5))
+        # No separate throttle here — ticket call already throttles
         r = request_with_retries(
             self.s, "GET", url,
             params={"_t": token_t},
