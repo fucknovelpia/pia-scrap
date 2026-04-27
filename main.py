@@ -2,6 +2,8 @@ import argparse
 import os
 import re
 import sys
+import warnings
+warnings.filterwarnings("ignore", message="urllib3.*doesn't match a supported version")
 
 from dotenv import load_dotenv
 from src.api import NovelpiaClient

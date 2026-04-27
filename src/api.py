@@ -42,15 +42,18 @@ class NovelpiaClient:
         self.throttle = max(0.0, float(throttle or 0.5))
         self.chapter_counter = 0
         self.default_max_workers = max(1, int(threads or 1))
-        self.recover_attempts = 3
-        self.recover_cooldown_min = 15.0
-        self.recover_cooldown_max = 30.0
-        self.recover_throttle = 4.0
+        self.recover_attempts = 2
+        self.recover_cooldown_min = 3.0
+        self.recover_cooldown_max = 8.0
+        self.recover_throttle = 2.0
         self.rotate_session_on_failure = True
         try:
             if not userkey:
                 userkey = uuid.uuid4().hex
-            self.s.cookies.set("USERKEY", userkey, domain=".novelpia.com", path="/")
+            # Set cookies on both domains to ensure they reach the API
+            for domain in [".novelpia.com"]:
+                self.s.cookies.set("USERKEY", userkey, domain=domain, path="/")
+                self.s.cookies.set("last_login", "google", domain=domain, path="/")
             self.tokens.userkey = userkey
             if tkey:
                 self.s.cookies.set("TKEY", tkey, domain=".novelpia.com", path="/")
@@ -278,7 +281,7 @@ class NovelpiaClient:
             results[idx - 1] = res
             if progress_cb:
                 ok = bool(res) and "error" not in res
-                progress_cb(idx, ok)
+                progress_cb(idx, ok, res)
         return results
 
     def _fetch_episodes_concurrent(self, ep_list: List[Dict[str, Any]], max_workers: int, progress_cb=None) -> List[Dict[str, Any]]:
@@ -290,15 +293,21 @@ class NovelpiaClient:
         throughput.
         """
         print(f"[info] Fetching with {max_workers} concurrent workers, {self.throttle}s delay between batches.")
-        results: List[Dict[str, Any]] = [{} for _ in range(len(ep_list))]
+        total = len(ep_list)
+        results: List[Dict[str, Any]] = [{} for _ in range(total)]
+        num_batches = (total + max_workers - 1) // max_workers
 
         # Temporarily disable per-request throttle since we throttle between batches
         saved_throttle = self.throttle
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            for batch_start in range(0, len(ep_list), max_workers):
+            for batch_start in range(0, total, max_workers):
                 batch = ep_list[batch_start:batch_start + max_workers]
                 batch_indices = list(range(batch_start, batch_start + len(batch)))
+                batch_num = batch_start // max_workers + 1
+                ch_ids = [i + 1 for i in batch_indices]
+                batch_t0 = time.time()
+                print(f"[batch {batch_num}/{num_batches}] Downloading Ch.{ch_ids[0]}-{ch_ids[-1]} ({len(batch)} chapters)...")
 
                 # Submit batch — no throttle inside batch for true parallelism
                 self.throttle = 0
@@ -317,7 +326,7 @@ class NovelpiaClient:
 
                     if (not res) or ("error" in res):
                         err = res.get("error") if res else "Unknown error"
-                        print(f"[warn] Chapter {idx} failed on initial attempt: {err}")
+                        print(f"[warn] Chapter {idx} failed: {err}")
                         self.throttle = saved_throttle  # restore for recovery
                         res = self._recover_episode(ep, idx)
                         self.throttle = 0  # back to batch mode
@@ -325,10 +334,13 @@ class NovelpiaClient:
                     results[idx - 1] = res
                     if progress_cb:
                         ok = bool(res) and "error" not in res
-                        progress_cb(idx, ok)
+                        progress_cb(idx, ok, res)
+
+                batch_elapsed = time.time() - batch_t0
+                print(f"[batch {batch_num}/{num_batches}] Done in {batch_elapsed:.1f}s")
 
                 # Throttle between batches
-                if batch_start + max_workers < len(ep_list):
+                if batch_start + max_workers < total:
                     time.sleep(saved_throttle)
 
         self.throttle = saved_throttle
@@ -454,13 +466,22 @@ def request_with_retries(session: requests.Session, method: str, url: str, *,
 
             # Handle too many requests or server errors (5xx)
             if r.status_code >= 500:
-                if on_rate_limit:
-                    on_rate_limit()
-                wait = max(5.0, backoff ** (attempt + 2)) + random.uniform(0.5, 1.5)
-                if const.HTTP_LOG:
-                    print(f"[api] !! Server error ({r.status_code}). Retrying after backoff...")
-                time.sleep(wait)
-                continue
+                # Check if it's actually an auth error disguised as 500
+                auth_err = False
+                try:
+                    body = r.json()
+                    msg = (body.get("errmsg") or body.get("message") or "").lower()
+                    if "logged in" in msg or "login" in msg:
+                        auth_err = True
+                except Exception:
+                    pass
+
+                if not auth_err:
+                    if on_rate_limit:
+                        on_rate_limit()
+                    wait = min(3.0, backoff ** attempt) + random.uniform(0.2, 0.8)
+                    time.sleep(wait)
+                    continue
 
             # Handle auth refresh-and-retry for all endpoints except login/refresh
             if allow_refresh and (refresh_fn or login_fn) and not did_login:
@@ -475,6 +496,8 @@ def request_with_retries(session: requests.Session, method: str, url: str, *,
                     except Exception:
                         pass
                     if "token" in msg and "expire" in msg:
+                        trigger_refresh = True
+                    elif "logged in" in msg or "login" in msg:
                         trigger_refresh = True
 
                 if trigger_refresh:

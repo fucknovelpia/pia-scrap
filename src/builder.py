@@ -1,5 +1,6 @@
 import json
 import os
+import time
 from typing import Dict, List, Optional
 
 from bs4 import BeautifulSoup
@@ -160,13 +161,28 @@ def build_txt(client, novel_id, out_dir, start_chapter=None, end_chapter=None, m
     total = 0
     failed = 0
     fetched_count = 0
+    failed_count = 0
     successful_episode_nos: List[int] = []
+    txt_start_time = time.time()
 
-    def update_pbar(idx, ok):
-        nonlocal fetched_count
+    def update_pbar(idx, ok, res=None):
+        nonlocal fetched_count, failed_count
         fetched_count += 1
-        state = "ok" if ok else "failed"
-        print(f"[progress] Chapter attempt {fetched_count}/{len(ep_list)} ({state})")
+        total_ep = len(ep_list)
+        pct = fetched_count * 100 // total_ep if total_ep else 100
+        elapsed = time.time() - txt_start_time
+        speed = fetched_count / elapsed * 60 if elapsed > 0 else 0
+        eta_s = (total_ep - fetched_count) / (fetched_count / elapsed) if elapsed > 0 and fetched_count > 0 else 0
+        eta_str = f"{int(eta_s // 60)}m{int(eta_s % 60):02d}s" if eta_s >= 60 else f"{int(eta_s)}s"
+        title_str = (res.get("epi_title") or "") if res and isinstance(res, dict) else ""
+        bar_w = 25
+        filled = int(bar_w * pct / 100)
+        if ok:
+            print(f"  {pct:3d}% | {fetched_count}/{total_ep} | {speed:.1f} ch/min | ETA {eta_str} | + Ch.{idx}: {title_str}")
+        else:
+            failed_count += 1
+            err = res.get("error", "unknown") if res else "unknown"
+            print(f"  {pct:3d}% | {fetched_count}/{total_ep} | {speed:.1f} ch/min | ETA {eta_str} | x Ch.{idx}: {title_str} -- {err}")
 
     cached_results: Dict[int, Dict] = {}
     episodes_to_fetch: List[Dict] = []

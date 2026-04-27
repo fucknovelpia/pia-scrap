@@ -126,7 +126,25 @@ def _run_webview_login(output_path: str) -> None:
     def poll_for_login(_window=None) -> None:
         nonlocal was_on_google
         _dbg("poll started...")
-        time.sleep(3)
+        time.sleep(5)
+
+        # Try immediate refresh — user may already be logged in from a previous session
+        _dbg("Trying immediate refresh (returning user)...")
+        login_at = try_refresh_token()
+        if login_at:
+            cookies = get_cookies_dict()
+            _dbg(f"Returning user SUCCESS! token={login_at[:50]}...")
+            result_holder["login_at"] = login_at
+            result_holder["userkey"] = cookies.get("USERKEY", "")
+            result_holder["tkey"] = cookies.get("TKEY", "")
+            _write_result(output_path, result_holder)
+            try:
+                window.destroy()
+            except Exception:
+                pass
+            return
+
+        _dbg("Not logged in yet, waiting for Google OAuth...")
 
         for i in range(900):
             try:
@@ -186,14 +204,20 @@ def _run_webview_login(output_path: str) -> None:
     except Exception:
         _sw, _sh = 1200, 900
 
+    # Persistent storage — keeps Google login cookies between sessions
+    storage_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".webview_data")
+    os.makedirs(storage_dir, exist_ok=True)
+    _dbg(f"Storage path: {storage_dir}")
+
     try:
         window = webview.create_window(
-            "Novelpia Global — Login (wait for auto-close)",
+            "Novelpia Global -- Login (wait for auto-close)",
             LOGIN_URL,
             width=int(_sw * 0.6),
             height=int(_sh * 0.7),
         )
-        webview.start(poll_for_login, window, debug=False)
+        webview.start(poll_for_login, window, debug=False,
+                      private_mode=False, storage_path=storage_dir)
     except Exception:
         _dbg(f"webview FAILED:\n{traceback.format_exc()}")
 

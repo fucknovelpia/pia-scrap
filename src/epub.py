@@ -199,12 +199,29 @@ class EpubBuilder:
             print(f"[info] Fetching {len(episodes_to_fetch)} uncached/new chapters from Novelpia.")
 
         fetched_count = 0
+        failed_count = 0
+        start_time = time.time()
 
-        def update_pbar(idx, ok):
-            nonlocal fetched_count
+        def update_pbar(idx, ok, res=None):
+            nonlocal fetched_count, failed_count
             fetched_count += 1
-            state = "ok" if ok else "failed"
-            print(f"[progress] Chapter attempt {fetched_count}/{len(episodes_to_fetch)} ({state})")
+            total = len(episodes_to_fetch)
+            pct = fetched_count * 100 // total if total else 100
+            elapsed = time.time() - start_time
+            speed = fetched_count / elapsed * 60 if elapsed > 0 else 0
+            eta_s = (total - fetched_count) / (fetched_count / elapsed) if elapsed > 0 and fetched_count > 0 else 0
+            eta_str = f"{int(eta_s // 60)}m{int(eta_s % 60):02d}s" if eta_s >= 60 else f"{int(eta_s)}s"
+
+            title = ""
+            if res and isinstance(res, dict):
+                title = res.get("epi_title") or ""
+
+            if ok:
+                print(f"  {pct:3d}% | {fetched_count}/{total} | {speed:.1f} ch/min | ETA {eta_str} | + Ch.{idx}: {title}")
+            else:
+                failed_count += 1
+                err = res.get("error", "unknown") if res else "unknown"
+                print(f"  {pct:3d}% | {fetched_count}/{total} | {speed:.1f} ch/min | ETA {eta_str} | x Ch.{idx}: {title} -- {err}")
 
         fetched_results = []
         if episodes_to_fetch:

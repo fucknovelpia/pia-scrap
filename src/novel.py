@@ -34,14 +34,33 @@ def html_from_episode_text(raw_html: str) -> str:
 
 def fetch_novel_and_episodes(client, novel_id, start_chapter=None, end_chapter=None, max_chapters=None):
     # Auth check — only if we have a session token
+    # Auth: verify the token is valid by decoding the JWT
     if client.tokens.login_at:
         try:
-            res = client.me()
-            if str(res.get("statusCode")) == "200":
-                mem = (((res.get("result") or {}).get("login") or {}).get("mem_nick")) or "Unknown"
-                print(f"[auth] Logged in as: {mem}")
-        except Exception:
-            pass
+            import base64, json as _json
+            parts = client.tokens.login_at.split(".")
+            if len(parts) >= 2:
+                payload = parts[1]
+                payload += "=" * (-len(payload) % 4)
+                data = _json.loads(base64.urlsafe_b64decode(payload))
+                import time as _time
+                exp = data.get("exp", 0)
+                now = int(_time.time())
+                mem_no = data.get("mem_no", "?")
+                if exp and now > exp:
+                    # Token expired — try refresh
+                    print(f"[auth] Token expired, attempting refresh...")
+                    try:
+                        client.refresh()
+                        print(f"[auth] Token refreshed successfully (member #{mem_no})")
+                    except Exception:
+                        print("[warn] Token expired and refresh failed -- falling back to anonymous mode.")
+                        client.tokens.login_at = None
+                else:
+                    remaining = exp - now if exp else 0
+                    print(f"[auth] Token valid for member #{mem_no} ({remaining // 60}m {remaining % 60}s remaining)")
+        except Exception as e:
+            print(f"[warn] Could not verify token: {e}")
 
     print("[info] extracting metadata…")
     data_novel = client.novel(novel_id)
