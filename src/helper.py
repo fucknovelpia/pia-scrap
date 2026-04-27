@@ -87,7 +87,8 @@ def save_config(cfg: Dict[str, Any]) -> None:
 def merge_login_at(headers: dict, login_at: Optional[str]) -> dict:
     h = dict(headers or {})
     if login_at:
-        h["login-at"] = login_at
+        from urllib.parse import unquote
+        h["login-at"] = unquote(login_at)
     return h
 
 def _mask_value(v: Any) -> Any:

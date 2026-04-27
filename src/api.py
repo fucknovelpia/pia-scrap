@@ -25,52 +25,11 @@ class Tokens:
     userkey: Optional[str] = None
 
 
-@dataclass(frozen=True)
-class FetchProfile:
-    name: str
-    max_workers: int
-    periodic_rest_every: int
-    periodic_rest_min: float
-    periodic_rest_max: float
-    recover_attempts: int
-    recover_cooldown_min: float
-    recover_cooldown_max: float
-    recover_throttle: float
-    rotate_session_on_failure: bool
-
-
-FETCH_PROFILES: Dict[str, FetchProfile] = {
-    "safe": FetchProfile(
-        name="safe",
-        max_workers=1,
-        periodic_rest_every=10,
-        periodic_rest_min=45.0,
-        periodic_rest_max=75.0,
-        recover_attempts=3,
-        recover_cooldown_min=180.0,
-        recover_cooldown_max=300.0,
-        recover_throttle=4.0,
-        rotate_session_on_failure=True,
-    ),
-    "fast-rotate": FetchProfile(
-        name="fast-rotate",
-        max_workers=3,
-        periodic_rest_every=0,
-        periodic_rest_min=0.0,
-        periodic_rest_max=0.0,
-        recover_attempts=2,
-        recover_cooldown_min=20.0,
-        recover_cooldown_max=45.0,
-        recover_throttle=3.0,
-        rotate_session_on_failure=True,
-    ),
-}
-
 class NovelpiaClient:
     def __init__(self, email: Optional[str] = None, password: Optional[str] = None,
-                 proxy: Optional[str] = None, timeout: int = 30, throttle: float = 1.5,
+                 proxy: Optional[str] = None, timeout: int = 30, throttle: float = 0.5,
                  userkey: Optional[str] = None, tkey: Optional[str] = None,
-                 fetch_profile: str = "safe"):
+                 threads: int = 1):
         self.s = requests.Session()
         self.s.headers.update(const.SESSION_HEADERS.copy())
         if proxy:
@@ -80,24 +39,21 @@ class NovelpiaClient:
         self.email = email
         self.password = password
         # delay seconds between episode-related API calls to reduce 429/500 rate limits
-        self.throttle = max(0.0, float(throttle or 1.5))
+        self.throttle = max(0.0, float(throttle or 0.5))
         self.chapter_counter = 0
-        self.fetch_profile_name = "safe"
-        self.fetch_profile = FETCH_PROFILES["safe"]
-        self.rest_every_chapters = 10
-        self.rest_min_seconds = 45.0
-        self.rest_max_seconds = 75.0
-        self.default_max_workers = 1
-        self.recover_attempts = 3
-        self.recover_cooldown_min = 180.0
-        self.recover_cooldown_max = 300.0
-        self.recover_throttle = 4.0
+        self.default_max_workers = max(1, int(threads or 1))
+        self.recover_attempts = 2
+        self.recover_cooldown_min = 3.0
+        self.recover_cooldown_max = 8.0
+        self.recover_throttle = 2.0
         self.rotate_session_on_failure = True
-        self.set_fetch_profile(fetch_profile)
         try:
             if not userkey:
                 userkey = uuid.uuid4().hex
-            self.s.cookies.set("USERKEY", userkey, domain=".novelpia.com", path="/")
+            # Set cookies on both domains to ensure they reach the API
+            for domain in [".novelpia.com"]:
+                self.s.cookies.set("USERKEY", userkey, domain=domain, path="/")
+                self.s.cookies.set("last_login", "google", domain=domain, path="/")
             self.tokens.userkey = userkey
             if tkey:
                 self.s.cookies.set("TKEY", tkey, domain=".novelpia.com", path="/")
@@ -105,19 +61,7 @@ class NovelpiaClient:
         except Exception as e:
             print(f"Error setting cookies: {e}")
 
-    def set_fetch_profile(self, profile_name: Optional[str]) -> None:
-        selected = FETCH_PROFILES.get((profile_name or "").strip().lower()) or FETCH_PROFILES["safe"]
-        self.fetch_profile_name = selected.name
-        self.fetch_profile = selected
-        self.rest_every_chapters = selected.periodic_rest_every
-        self.rest_min_seconds = selected.periodic_rest_min
-        self.rest_max_seconds = selected.periodic_rest_max
-        self.default_max_workers = max(1, selected.max_workers)
-        self.recover_attempts = max(1, selected.recover_attempts)
-        self.recover_cooldown_min = max(0.0, selected.recover_cooldown_min)
-        self.recover_cooldown_max = max(self.recover_cooldown_min, selected.recover_cooldown_max)
-        self.recover_throttle = max(0.0, selected.recover_throttle)
-        self.rotate_session_on_failure = bool(selected.rotate_session_on_failure)
+
 
     def login(self):
         url = f"{const.API_BASE}/v1/member/login"
@@ -141,9 +85,11 @@ class NovelpiaClient:
 
     def refresh(self) -> Optional[str]:
         url = f"{const.API_BASE}/v1/login/refresh"
+        # /v1/login/refresh works with session cookies alone (USERKEY).
+        # Do NOT send login-at header — if the JWT is expired, the API
+        # will reject the request even though cookies would succeed.
         r = request_with_retries(
             self.s, "GET", url,
-            headers=merge_login_at({}, self.tokens.login_at),
             timeout=self.timeout, max_retries=2,
         )
         r.raise_for_status()
@@ -188,12 +134,14 @@ class NovelpiaClient:
 
     def novel(self, novel_id: int) -> Dict:
         url = f"{const.API_BASE}/v1/novel"
+        has_auth = bool(self.tokens.login_at or self.email)
         r = request_with_retries(
             self.s, "GET", url,
             headers=merge_login_at({}, self.tokens.login_at),
             params={"novel_no": novel_id},
-            timeout=self.timeout, allow_refresh=True, 
-            refresh_fn=self.refresh, login_fn=self.login,
+            timeout=self.timeout, allow_refresh=has_auth, 
+            refresh_fn=self.refresh if has_auth else None,
+            login_fn=self.login if has_auth else None,
             on_rate_limit=self._on_rate_limit
         )
         r.raise_for_status()
@@ -201,12 +149,14 @@ class NovelpiaClient:
 
     def episode_list(self, novel_id: int, rows: int) -> Dict:
         url = f"{const.API_BASE}/v1/novel/episode/list"
+        has_auth = bool(self.tokens.login_at or self.email)
         r = request_with_retries(
             self.s, "GET", url,
             headers=merge_login_at({}, self.tokens.login_at),
             params={"novel_no": novel_id, "rows": rows, "sort": "ASC"},
-            timeout=self.timeout, allow_refresh=True, 
-            refresh_fn=self.refresh, login_fn=self.login,
+            timeout=self.timeout, allow_refresh=has_auth, 
+            refresh_fn=self.refresh if has_auth else None,
+            login_fn=self.login if has_auth else None,
             on_rate_limit=self._on_rate_limit
         )
         r.raise_for_status()
@@ -218,7 +168,7 @@ class NovelpiaClient:
         params = {"episode_no": episode_no}
         # Throttle before hitting ticket endpoint to avoid rate limits
         if self.throttle:
-            time.sleep(self.throttle + random.uniform(1.0, 1.5))
+            time.sleep(self.throttle)
         r = request_with_retries(
             self.s, "GET", url,
             headers=headers, params=params,
@@ -232,9 +182,7 @@ class NovelpiaClient:
 
     def episode_content(self, token_t: str) -> Dict:
         url = f"{const.API_BASE}/v1/novel/episode/content"
-        # Throttle content fetch too, to be safe
-        if self.throttle:
-            time.sleep(self.throttle + random.uniform(1.0, 1.5))
+        # No separate throttle here — ticket call already throttles
         r = request_with_retries(
             self.s, "GET", url,
             params={"_t": token_t},
@@ -259,7 +207,6 @@ class NovelpiaClient:
         epi_no = int(episode_no)
         epi_title = ep.get("epi_title") or f"Episode {ep.get('epi_num')}"
         self.chapter_counter += 1
-        self._rest_if_needed(idx, epi_title)
         
         # 1) Ticket
         try:
@@ -316,21 +263,6 @@ class NovelpiaClient:
             "idx": idx,
         }
 
-    def _rest_if_needed(self, idx: int, epi_title: str) -> None:
-        if self.chapter_counter <= 1:
-            return
-        if self.rest_every_chapters <= 0:
-            return
-        if self.chapter_counter % self.rest_every_chapters != 1:
-            return
-
-        wait = random.uniform(self.rest_min_seconds, self.rest_max_seconds)
-        print(
-            f"[info] Cooldown pause: waiting {wait:.1f}s before chapter {idx} ({epi_title}) "
-            f"after {self.rest_every_chapters} chapters."
-        )
-        time.sleep(wait)
-
     def fetch_episodes_parallel(self, ep_list: List[Dict[str, Any]], max_workers: int = 1, progress_cb=None) -> List[Dict[str, Any]]:
         """Fetch multiple episodes using the active fetch profile."""
         worker_count = max(1, int(max_workers or self.default_max_workers or 1))
@@ -349,35 +281,69 @@ class NovelpiaClient:
             results[idx - 1] = res
             if progress_cb:
                 ok = bool(res) and "error" not in res
-                progress_cb(idx, ok)
+                progress_cb(idx, ok, res)
         return results
 
     def _fetch_episodes_concurrent(self, ep_list: List[Dict[str, Any]], max_workers: int, progress_cb=None) -> List[Dict[str, Any]]:
-        print(
-            f"[info] Using fast profile '{self.fetch_profile_name}' with {max_workers} concurrent workers."
-        )
-        results: List[Dict[str, Any]] = [{} for _ in range(len(ep_list))]
+        """Fetch episodes in batches of max_workers, like NpiaDownloader67.
+
+        Each batch submits max_workers chapters simultaneously with no
+        per-request throttle inside the batch. The throttle delay is applied
+        between batches instead, preventing rate limits while maximising
+        throughput.
+        """
+        print(f"[info] Fetching with {max_workers} concurrent workers, {self.throttle}s delay between batches.")
+        total = len(ep_list)
+        results: List[Dict[str, Any]] = [{} for _ in range(total)]
+        num_batches = (total + max_workers - 1) // max_workers
+
+        # Temporarily disable per-request throttle since we throttle between batches
+        saved_throttle = self.throttle
+
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_map = {
-                executor.submit(self.fetch_episode, ep, idx): (idx, ep)
-                for idx, ep in enumerate(ep_list, 1)
-            }
-            for future in concurrent.futures.as_completed(future_map):
-                idx, ep = future_map[future]
-                try:
-                    res = future.result()
-                except Exception as e:
-                    res = {"error": str(e), "idx": idx}
+            for batch_start in range(0, total, max_workers):
+                batch = ep_list[batch_start:batch_start + max_workers]
+                batch_indices = list(range(batch_start, batch_start + len(batch)))
+                batch_num = batch_start // max_workers + 1
+                ch_ids = [i + 1 for i in batch_indices]
+                batch_t0 = time.time()
+                print(f"[batch {batch_num}/{num_batches}] Downloading Ch.{ch_ids[0]}-{ch_ids[-1]} ({len(batch)} chapters)...")
 
-                if (not res) or ("error" in res):
-                    err = res.get("error") if res else "Unknown error"
-                    print(f"[warn] Chapter {idx} failed on initial fast attempt: {err}")
-                    res = self._recover_episode(ep, idx)
+                # Submit batch — no throttle inside batch for true parallelism
+                self.throttle = 0
+                future_map = {}
+                for i, ep in zip(batch_indices, batch):
+                    idx = i + 1  # 1-based
+                    future_map[executor.submit(self.fetch_episode, ep, idx)] = (idx, ep)
 
-                results[idx - 1] = res
-                if progress_cb:
-                    ok = bool(res) and "error" not in res
-                    progress_cb(idx, ok)
+                # Wait for batch to complete
+                for future in concurrent.futures.as_completed(future_map):
+                    idx, ep = future_map[future]
+                    try:
+                        res = future.result()
+                    except Exception as e:
+                        res = {"error": str(e), "idx": idx}
+
+                    if (not res) or ("error" in res):
+                        err = res.get("error") if res else "Unknown error"
+                        print(f"[warn] Chapter {idx} failed: {err}")
+                        self.throttle = saved_throttle  # restore for recovery
+                        res = self._recover_episode(ep, idx)
+                        self.throttle = 0  # back to batch mode
+
+                    results[idx - 1] = res
+                    if progress_cb:
+                        ok = bool(res) and "error" not in res
+                        progress_cb(idx, ok, res)
+
+                batch_elapsed = time.time() - batch_t0
+                print(f"[batch {batch_num}/{num_batches}] Done in {batch_elapsed:.1f}s")
+
+                # Throttle between batches
+                if batch_start + max_workers < total:
+                    time.sleep(saved_throttle)
+
+        self.throttle = saved_throttle
         return results
 
     def _recover_episode(self, ep: Dict[str, Any], idx: int) -> Dict[str, Any]:
@@ -500,13 +466,22 @@ def request_with_retries(session: requests.Session, method: str, url: str, *,
 
             # Handle too many requests or server errors (5xx)
             if r.status_code >= 500:
-                if on_rate_limit:
-                    on_rate_limit()
-                wait = max(5.0, backoff ** (attempt + 2)) + random.uniform(0.5, 1.5)
-                if const.HTTP_LOG:
-                    print(f"[api] !! Server error ({r.status_code}). Retrying after backoff...")
-                time.sleep(wait)
-                continue
+                # Check if it's actually an auth error disguised as 500
+                auth_err = False
+                try:
+                    body = r.json()
+                    msg = (body.get("errmsg") or body.get("message") or "").lower()
+                    if "logged in" in msg or "login" in msg:
+                        auth_err = True
+                except Exception:
+                    pass
+
+                if not auth_err:
+                    if on_rate_limit:
+                        on_rate_limit()
+                    wait = min(3.0, backoff ** attempt) + random.uniform(0.2, 0.8)
+                    time.sleep(wait)
+                    continue
 
             # Handle auth refresh-and-retry for all endpoints except login/refresh
             if allow_refresh and (refresh_fn or login_fn) and not did_login:
@@ -521,6 +496,8 @@ def request_with_retries(session: requests.Session, method: str, url: str, *,
                     except Exception:
                         pass
                     if "token" in msg and "expire" in msg:
+                        trigger_refresh = True
+                    elif "logged in" in msg or "login" in msg:
                         trigger_refresh = True
 
                 if trigger_refresh:
