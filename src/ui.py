@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import json
+import multiprocessing
+import os
 import subprocess
 import sys
+import tempfile
 import threading
+import time
 import tkinter as tk
 from datetime import datetime
 from pathlib import Path
@@ -11,16 +16,21 @@ from tkinter import ttk, messagebox
 
 from dotenv import dotenv_values
 
-from src.api import FETCH_PROFILES
+
 from src.chrome_session import list_chrome_profiles, load_chrome_novelpia_session
+from src.const import APP_DIR
 from src.helper import load_config, save_config
 
 CHROME_BINARY = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
-LOG_DIR = Path(__file__).resolve().parent.parent / "output" / "logs"
+ENV_PATH = APP_DIR / ".env"
+LOG_DIR = APP_DIR / "output" / "logs"
 
 
 def launch_ui() -> None:
+    # When frozen, ensure CWD is the exe's directory (not the temp extraction dir)
+    if getattr(sys, 'frozen', False):
+        os.chdir(Path(sys.executable).parent)
+
     root = tk.Tk()
     root.title("PIA Scrap")
     root.geometry("900x700")
@@ -42,10 +52,8 @@ def launch_ui() -> None:
     out_var = tk.StringVar(value="output")
     txt_var = tk.BooleanVar(value=False)
     batch_links_var = tk.StringVar(value="output/novel_links.txt")
-    saved_fetch_profile = str(cfg.get("fetch_profile") or "safe")
-    if saved_fetch_profile not in FETCH_PROFILES:
-        saved_fetch_profile = "safe"
-    fetch_profile_var = tk.StringVar(value=saved_fetch_profile)
+    threads_var = tk.IntVar(value=int(cfg.get("threads") or 1))
+    interval_var = tk.DoubleVar(value=float(cfg.get("interval") or 0.5))
     scrape_out_var = tk.StringVar(value="output/novel_links.txt")
     page_start_var = tk.StringVar(value="1")
     page_end_var = tk.StringVar(value="63")
@@ -55,6 +63,9 @@ def launch_ui() -> None:
     current_process: subprocess.Popen[str] | None = None
     auto_import_after_login = tk.BooleanVar(value=False)
     current_log_path: Path | None = None
+    was_cancelled = False
+    cancel_event = threading.Event()
+    worker_thread: threading.Thread | None = None
 
     def set_status(text: str) -> None:
         status_var.set(text)
@@ -73,7 +84,6 @@ def launch_ui() -> None:
         batch_download_btn.config(state=state)
         scrape_btn.config(state=state)
         profile_combo.config(state=readonly_state)
-        profile_combo_download.config(state=readonly_state)
         cancel_btn.config(state=("normal" if is_busy else "disabled"))
 
     def append_log(text: str) -> None:
@@ -185,7 +195,8 @@ def launch_ui() -> None:
                 "login_at": login_at_var.get().strip(),
                 "userkey": userkey_var.get().strip(),
                 "tkey": tkey_var.get().strip(),
-                "fetch_profile": fetch_profile_var.get().strip() or "safe",
+                "threads": threads_var.get(),
+                "interval": interval_var.get(),
             }
         )
         set_status("Saved session to .api.json.")
@@ -217,55 +228,123 @@ def launch_ui() -> None:
         def worker() -> None:
             nonlocal current_process, current_log_path
             try:
-                env = dict(**__import__("os").environ)
-                env["PYTHONUNBUFFERED"] = "1"
                 LOG_DIR.mkdir(parents=True, exist_ok=True)
                 action = "scrape" if "--scrape-novel-links" in args else "batch-download" if "--novel-links-file" in args else "download"
                 ts = datetime.now().strftime("%Y%m%d-%H%M%S")
                 current_log_path = LOG_DIR / f"{action}-{ts}.log"
-                proc = subprocess.Popen(
-                    [sys.executable, "main.py", *args],
-                    text=True,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    cwd=Path(__file__).resolve().parent.parent,
-                    bufsize=1,
-                    env=env,
-                )
-                current_process = proc
-                output_parts: list[str] = []
-                assert proc.stdout is not None
-                with current_log_path.open("w", encoding="utf-8") as logf:
-                    logf.write(f"$ {' '.join(['python', 'main.py', *args])}\n\n")
-                    for raw_line in proc.stdout:
-                        line = raw_line.replace("\r", "\n")
-                        output_parts.append(line)
-                        logf.write(line)
-                        logf.flush()
-                        log_queue.put(line)
-                proc.wait()
-                output = "".join(output_parts)
-                root.after(0, lambda: finish_run(proc.returncode or 0, output, success_message))
+
+                if getattr(sys, 'frozen', False):
+                    # Frozen exe: run main() in-process with stdout redirected
+                    import io
+
+                    class QueueWriter(io.TextIOBase):
+                        """Redirect stdout/stderr to the UI log queue and log file."""
+                        def __init__(self, queue, logf):
+                            self._queue = queue
+                            self._logf = logf
+                        def write(self, s):
+                            if s:
+                                self._queue.put(s)
+                                self._logf.write(s)
+                                self._logf.flush()
+                            return len(s) if s else 0
+                        def flush(self):
+                            pass
+
+                    with current_log_path.open("w", encoding="utf-8") as logf:
+                        logf.write(f"$ PIA-Scrap.exe {' '.join(args)}\n\n")
+                        writer = QueueWriter(log_queue, logf)
+                        old_stdout, old_stderr = sys.stdout, sys.stderr
+                        old_argv = sys.argv
+                        old_cwd = os.getcwd()
+                        try:
+                            # CWD must be the exe's directory for .api.json, output/, etc.
+                            os.chdir(Path(sys.executable).parent)
+                            sys.stdout = writer
+                            sys.stderr = writer
+                            sys.argv = ["PIA-Scrap.exe", *args]
+                            from main import main as _main
+                            _main()
+                            root.after(0, lambda: finish_run(0, "", success_message))
+                        except SystemExit as e:
+                            code = e.code if isinstance(e.code, int) else 1
+                            root.after(0, lambda: finish_run(code, "", success_message))
+                        except KeyboardInterrupt:
+                            root.after(0, lambda: finish_run(1, "", success_message))
+                        except Exception as e:
+                            import traceback
+                            err = traceback.format_exc()
+                            writer.write(f"\n[error] {err}\n")
+                            root.after(0, lambda: finish_run(1, str(e), success_message))
+                        finally:
+                            sys.stdout = old_stdout
+                            sys.stderr = old_stderr
+                            sys.argv = old_argv
+                            os.chdir(old_cwd)
+                else:
+                    # Source mode: spawn subprocess as before
+                    env = dict(**__import__("os").environ)
+                    env["PYTHONUNBUFFERED"] = "1"
+                    env["PYTHONIOENCODING"] = "utf-8"
+                    cmd = [sys.executable, "main.py", *args]
+                    popen_kwargs = dict(
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        stdin=subprocess.DEVNULL,
+                        cwd=Path(__file__).resolve().parent.parent,
+                        bufsize=1,
+                        env=env,
+                    )
+                    proc = subprocess.Popen(cmd, **popen_kwargs)
+                    current_process = proc
+                    output_parts: list[str] = []
+                    assert proc.stdout is not None
+                    with current_log_path.open("w", encoding="utf-8") as logf:
+                        logf.write(f"$ {' '.join(cmd)}\n\n")
+                        for raw_line in proc.stdout:
+                            line = raw_line.replace("\r", "\n")
+                            output_parts.append(line)
+                            logf.write(line)
+                            logf.flush()
+                            log_queue.put(line)
+                    proc.wait()
+                    output = "".join(output_parts)
+                    root.after(0, lambda: finish_run(proc.returncode or 0, output, success_message))
             except Exception as e:
+                import traceback
+                err_msg = f"[error] Failed: {e}\n{traceback.format_exc()}\n"
+                log_queue.put(err_msg)
                 root.after(0, lambda: finish_run(1, str(e), success_message))
             finally:
                 current_process = None
 
         set_busy(True)
+        cancel_event.clear()
+        try:
+            from src.api import cancel_event as api_cancel
+            api_cancel.clear()
+        except Exception:
+            pass
         set_status(running_message)
         clear_log()
-        append_log(f"$ {' '.join(['python', 'main.py', *args])}\n\n")
+        cmd_display = f"python main.py {' '.join(args)}"
+        append_log(f"$ {cmd_display}\n\n")
         threading.Thread(target=worker, daemon=True).start()
 
     def finish_run(returncode: int, output: str, success_message: str) -> None:
+        nonlocal was_cancelled
         set_busy(False)
         output = (output or "").strip()
-        if returncode == -15:
-            msg = "Command cancelled."
+        # Handle user cancellation (Windows terminate() returns 1, Unix returns -15)
+        if was_cancelled:
+            was_cancelled = False
+            msg = "Download cancelled by user."
             if current_log_path:
-                msg += f" Log: {current_log_path}"
+                msg += f"\nLog: {current_log_path}"
             set_status(msg)
-            messagebox.showinfo("Cancelled", msg)
             return
         if returncode == 0:
             msg = summarize_output(output, success_message)
@@ -281,23 +360,39 @@ def launch_ui() -> None:
             messagebox.showerror("Run failed", msg)
 
     def cancel_run() -> None:
-        nonlocal current_process
-        proc = current_process
-        if not proc or proc.poll() is not None:
-            set_status("No running command to cancel.")
-            return
+        nonlocal current_process, was_cancelled
+        if was_cancelled:
+            return  # already cancelling
+        was_cancelled = True
+        cancel_event.set()
         try:
-            proc.terminate()
-            append_log("\n[ui] Cancel requested. Terminating running command...\n")
-            set_status("Cancelling command...")
-        except Exception as e:
-            messagebox.showerror("Cancel failed", str(e))
+            from src.api import cancel_event as api_cancel
+            api_cancel.set()
+        except Exception:
+            pass
+        proc = current_process
+        if proc and proc.poll() is None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+        append_log("\n[ui] Cancel requested. Stopping...\n")
+        set_status("Cancelling...")
 
     def run_download() -> None:
         novel_id = novel_id_var.get().strip()
         if not novel_id:
             messagebox.showerror("Download", "Please enter a novel ID.")
             return
+
+        # Auto-save settings so they persist across sessions
+        save_config({
+            "login_at": login_at_var.get().strip(),
+            "userkey": userkey_var.get().strip(),
+            "tkey": tkey_var.get().strip(),
+            "threads": threads_var.get(),
+            "interval": interval_var.get(),
+        })
 
         args = [novel_id, "--out", out_var.get().strip() or "output"]
         if email_var.get().strip():
@@ -312,14 +407,13 @@ def launch_ui() -> None:
             args += ["--tkey", tkey_var.get().strip()]
         if txt_var.get():
             args.append("--txt")
-        args += ["--fetch-profile", fetch_profile_var.get().strip() or "safe"]
+        args += ["--threads", str(threads_var.get()), "--throttle", str(interval_var.get())]
 
         mode = "TXT" if txt_var.get() else "EPUB"
-        profile_label = fetch_profile_var.get().strip() or "safe"
         run_command(
             args,
             f"Finished downloading novel {novel_id}.",
-            f"Downloading novel {novel_id} as {mode} with profile {profile_label}...",
+            f"Downloading novel {novel_id} as {mode}...",
         )
 
     def run_link_scrape() -> None:
@@ -353,14 +447,13 @@ def launch_ui() -> None:
             args += ["--tkey", tkey_var.get().strip()]
         if txt_var.get():
             args.append("--txt")
-        args += ["--fetch-profile", fetch_profile_var.get().strip() or "safe"]
+        args += ["--threads", str(threads_var.get()), "--throttle", str(interval_var.get())]
 
         mode = "TXT" if txt_var.get() else "EPUB"
-        profile_label = fetch_profile_var.get().strip() or "safe"
         run_command(
             args,
             f"Finished batch download from {links_file}.",
-            f"Batch downloading novels from {links_file} as {mode} with profile {profile_label}...",
+            f"Batch downloading novels from {links_file} as {mode}...",
         )
 
     root.columnconfigure(0, weight=1)
@@ -404,38 +497,108 @@ def launch_ui() -> None:
 
     ttk.Separator(creds_tab).grid(row=3, column=0, columnspan=3, sticky="ew", pady=(4, 12))
 
-    ttk.Label(creds_tab, text="Chrome profile").grid(row=4, column=0, sticky="w", pady=4)
+    # --- Login with Google (webview) ---
+    def google_login() -> None:
+        """Launch embedded webview for Google OAuth login."""
+        from src.webview_login import _run_webview_login
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".loginkey", mode="w") as tmp:
+            key_path = tmp.name
+
+        def poll_result():
+            for _ in range(900):
+                try:
+                    if os.path.exists(key_path) and os.path.getsize(key_path) > 2:
+                        with open(key_path, "r", encoding="utf-8") as f:
+                            data = json.load(f)
+                        login_at = (data.get("login_at") or "").strip()
+                        userkey = (data.get("userkey") or "").strip()
+                        tkey = (data.get("tkey") or "").strip()
+                        if login_at:
+                            login_at_var.set(login_at)
+                            if userkey:
+                                userkey_var.set(userkey)
+                            if tkey:
+                                tkey_var.set(tkey)
+                            set_status("Google login: session captured successfully.")
+                            append_log("[auth] Google login: login-at token captured.\n")
+                            save_config({
+                                "login_at": login_at,
+                                "userkey": userkey,
+                                "tkey": tkey,
+                            })
+                            try:
+                                os.remove(key_path)
+                            except Exception:
+                                pass
+                            return
+                except Exception:
+                    pass
+                time.sleep(1)
+            set_status("Google login: session not captured (timed out).")
+            append_log("[auth] Google login: timed out waiting for token.\n")
+
+        try:
+            import webview
+            if not hasattr(webview, 'create_window'):
+                raise ImportError("wrong webview module")
+        except Exception as _wv_err:
+            messagebox.showerror(
+                "Missing Dependency",
+                f"pywebview could not be loaded:\n\n{_wv_err}\n\n"
+                "Run: pip install pywebview pythonnet"
+            )
+            return
+
+        try:
+            proc = multiprocessing.Process(target=_run_webview_login, args=(key_path,), daemon=True)
+            proc.start()
+            append_log(f"[auth] Webview process started (PID: {proc.pid}).\n")
+        except Exception as e:
+            messagebox.showerror("Google Login Failed", f"Could not start webview process:\n\n{e}")
+            return
+
+        set_status("Google login: browser opened. Log in with your Google account...")
+        append_log("[auth] Opening Novelpia Global login browser...\n")
+        threading.Thread(target=poll_result, daemon=True).start()
+
+    google_login_btn = ttk.Button(creds_tab, text="Login with Google", command=google_login)
+    google_login_btn.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(0, 12))
+
+    ttk.Separator(creds_tab).grid(row=5, column=0, columnspan=3, sticky="ew", pady=(4, 12))
+
+    ttk.Label(creds_tab, text="Chrome profile").grid(row=6, column=0, sticky="w", pady=4)
     profile_combo = ttk.Combobox(creds_tab, textvariable=profile_var, values=chrome_profiles, state="readonly")
-    profile_combo.grid(row=4, column=1, sticky="ew", pady=4)
+    profile_combo.grid(row=6, column=1, sticky="ew", pady=4)
     import_btn = ttk.Button(creds_tab, text="Import From Chrome", command=import_from_chrome)
-    import_btn.grid(row=4, column=2, sticky="ew", padx=(12, 0), pady=4)
+    import_btn.grid(row=6, column=2, sticky="ew", padx=(12, 0), pady=4)
     login_import_btn = ttk.Button(creds_tab, text="Login In Chrome And Import", command=open_chrome_login_and_import)
-    login_import_btn.grid(row=5, column=1, sticky="ew", pady=4)
+    login_import_btn.grid(row=7, column=1, sticky="ew", pady=4)
     login_btn = ttk.Button(creds_tab, text="Open Chrome Login", command=lambda: open_chrome_login(auto_import=False))
-    login_btn.grid(row=5, column=2, sticky="ew", padx=(12, 0), pady=4)
+    login_btn.grid(row=7, column=2, sticky="ew", padx=(12, 0), pady=4)
 
-    ttk.Label(creds_tab, text="login-at").grid(row=6, column=0, sticky="w", pady=4)
-    ttk.Entry(creds_tab, textvariable=login_at_var).grid(row=6, column=1, columnspan=2, sticky="ew", pady=4)
+    ttk.Label(creds_tab, text="login-at").grid(row=8, column=0, sticky="w", pady=4)
+    ttk.Entry(creds_tab, textvariable=login_at_var).grid(row=8, column=1, columnspan=2, sticky="ew", pady=4)
 
-    ttk.Label(creds_tab, text="USERKEY").grid(row=7, column=0, sticky="w", pady=4)
-    ttk.Entry(creds_tab, textvariable=userkey_var).grid(row=7, column=1, columnspan=2, sticky="ew", pady=4)
+    ttk.Label(creds_tab, text="USERKEY").grid(row=9, column=0, sticky="w", pady=4)
+    ttk.Entry(creds_tab, textvariable=userkey_var).grid(row=9, column=1, columnspan=2, sticky="ew", pady=4)
 
-    ttk.Label(creds_tab, text="TKEY").grid(row=8, column=0, sticky="w", pady=4)
-    ttk.Entry(creds_tab, textvariable=tkey_var).grid(row=8, column=1, columnspan=2, sticky="ew", pady=4)
+    ttk.Label(creds_tab, text="TKEY").grid(row=10, column=0, sticky="w", pady=4)
+    ttk.Entry(creds_tab, textvariable=tkey_var).grid(row=10, column=1, columnspan=2, sticky="ew", pady=4)
 
-    ttk.Label(creds_tab, text="LOGINKEY").grid(row=9, column=0, sticky="w", pady=4)
+    ttk.Label(creds_tab, text="LOGINKEY").grid(row=11, column=0, sticky="w", pady=4)
     ttk.Entry(creds_tab, textvariable=login_key_var, state="readonly").grid(
-        row=9, column=1, columnspan=2, sticky="ew", pady=4
+        row=11, column=1, columnspan=2, sticky="ew", pady=4
     )
     save_btn = ttk.Button(creds_tab, text="Save Session", command=save_session_to_config)
-    save_btn.grid(row=10, column=2, sticky="e", pady=(8, 0))
+    save_btn.grid(row=12, column=2, sticky="e", pady=(8, 0))
 
     ttk.Label(
         creds_tab,
-        text="Email/password are used first. Imported browser session is optional.",
+        text="Email/password are used first. Google login or imported browser session is optional.",
         wraplength=760,
         justify="left",
-    ).grid(row=11, column=0, columnspan=3, sticky="w", pady=(12, 0))
+    ).grid(row=13, column=0, columnspan=3, sticky="w", pady=(12, 0))
 
     ttk.Label(download_tab, text="Novel ID").grid(row=0, column=0, sticky="w", pady=4)
     ttk.Entry(download_tab, textvariable=novel_id_var).grid(row=0, column=1, sticky="ew", pady=4)
@@ -449,33 +612,34 @@ def launch_ui() -> None:
     ttk.Label(download_tab, text="Batch links file").grid(row=2, column=0, sticky="w", pady=4)
     ttk.Entry(download_tab, textvariable=batch_links_var).grid(row=2, column=1, columnspan=2, sticky="ew", pady=4)
 
-    ttk.Label(download_tab, text="Speed profile").grid(row=3, column=0, sticky="w", pady=4)
-    profile_values = list(sorted(FETCH_PROFILES.keys()))
-    profile_combo_download = ttk.Combobox(
-        download_tab,
-        textvariable=fetch_profile_var,
-        values=profile_values,
-        state="readonly",
-    )
-    profile_combo_download.grid(row=3, column=1, sticky="ew", pady=4)
+    ttk.Label(download_tab, text="Threads").grid(row=3, column=0, sticky="w", pady=4)
+    ttk.Spinbox(download_tab, from_=1, to=10, textvariable=threads_var, width=5).grid(row=3, column=1, sticky="w", pady=4)
     ttk.Label(
         download_tab,
-        text="safe = current conservative mode | fast-rotate = original-style speed with session refresh/re-login on failure",
-        wraplength=420,
+        text="Concurrent download workers (1 = sequential)",
         justify="left",
     ).grid(row=3, column=2, sticky="w", padx=(12, 0), pady=4)
+
+    ttk.Label(download_tab, text="Interval (s)").grid(row=4, column=0, sticky="w", pady=4)
+    ttk.Spinbox(download_tab, from_=0.0, to=10.0, increment=0.1, textvariable=interval_var, width=5, format="%.1f").grid(row=4, column=1, sticky="w", pady=4)
+    ttk.Label(
+        download_tab,
+        text="Delay between requests in seconds (0.5 recommended)",
+        justify="left",
+    ).grid(row=4, column=2, sticky="w", padx=(12, 0), pady=4)
+
     ttk.Button(
         download_tab,
-        text="Save Profile",
+        text="Save Settings",
         command=save_session_to_config,
-    ).grid(row=4, column=0, sticky="w", pady=(12, 0))
+    ).grid(row=5, column=0, sticky="w", pady=(12, 0))
 
     cancel_btn = ttk.Button(download_tab, text="Cancel", command=cancel_run, state="disabled")
-    cancel_btn.grid(row=4, column=1, sticky="e", pady=(12, 0))
+    cancel_btn.grid(row=5, column=1, sticky="e", pady=(12, 0))
     batch_download_btn = ttk.Button(download_tab, text="Run Batch Download", command=run_batch_download)
-    batch_download_btn.grid(row=4, column=2, sticky="w", pady=(12, 0))
+    batch_download_btn.grid(row=5, column=2, sticky="w", pady=(12, 0))
     download_btn = ttk.Button(download_tab, text="Run Download", command=run_download)
-    download_btn.grid(row=4, column=2, sticky="e", pady=(12, 0))
+    download_btn.grid(row=5, column=2, sticky="e", pady=(12, 0))
 
     ttk.Label(scrape_tab, text="Page start").grid(row=0, column=0, sticky="w", pady=4)
     ttk.Entry(scrape_tab, textvariable=page_start_var).grid(row=0, column=1, sticky="ew", pady=4)
@@ -496,6 +660,20 @@ def launch_ui() -> None:
     log_scroll.grid(row=1, column=1, sticky="ns")
     log_text.configure(yscrollcommand=log_scroll.set)
 
+    def on_close():
+        """Clean shutdown: cancel any running work, then force-exit."""
+        cancel_event.set()
+        try:
+            from src.api import cancel_event as api_cancel
+            api_cancel.set()
+        except Exception:
+            pass
+        root.destroy()
+        # Force exit to prevent PyInstaller temp dir cleanup warnings
+        import os
+        os._exit(0)
+
+    root.protocol("WM_DELETE_WINDOW", on_close)
     root.after(120, poll_log_queue)
     root.bind("<FocusIn>", on_focus_in)
 

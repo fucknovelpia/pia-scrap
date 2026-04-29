@@ -2,9 +2,11 @@ import argparse
 import os
 import re
 import sys
+import warnings
+warnings.filterwarnings("ignore", message="urllib3.*doesn't match a supported version")
 
 from dotenv import load_dotenv
-from src.api import FETCH_PROFILES, NovelpiaClient
+from src.api import NovelpiaClient
 from src.builder import build_epub, build_txt
 from src.chrome_session import load_chrome_novelpia_session
 from src.helper import load_config, save_config
@@ -97,10 +99,24 @@ def run_single_build_with_recovery(client, args, novel_id: int, attempts: int = 
     assert last_error is not None
     raise last_error
 
+def parse_novel_id(value: str) -> int:
+    """Accept a novel ID or a Novelpia URL and return the numeric ID."""
+    value = value.strip()
+    if value.isdigit():
+        return int(value)
+    m = NOVEL_LINK_RE.search(value)
+    if m:
+        return int(m.group(1))
+    # Try to find any trailing number in the URL (e.g. /viewer/586921)
+    m = re.search(r"/(\d+)(?:[/?#]|$)", value)
+    if m:
+        return int(m.group(1))
+    raise argparse.ArgumentTypeError(f"Cannot extract novel ID from: {value}")
+
 def main():
     load_dotenv()
     ap = argparse.ArgumentParser(description="Novelpia → EPUB packer (API)")
-    ap.add_argument("novel_id", type=int, nargs="?", help="novel_no (e.g., 1072)")
+    ap.add_argument("novel_id", type=parse_novel_id, nargs="?", help="Novel ID or URL (e.g., 1072 or https://global.novelpia.com/novel/1072)")
     ap.add_argument("--ui", action="store_true", help="Launch the desktop UI")
     ap.add_argument("--user", "--email", "-u", "-e", dest="email", help="Novelpia email (overrides config tokens if provided)")
     ap.add_argument("--pass", "--password", "-p", dest="password", help="Novelpia password (overrides config tokens if provided)")
@@ -116,13 +132,8 @@ def main():
     ap.add_argument("--lang", default="en", help="EPUB language code (default: en)")
     ap.add_argument("--proxy", default=None, help="HTTP/HTTPS proxy, e.g. http://host:port")
     ap.add_argument("--debug", "-v", action="store_true", help="Enable verbose HTTP request/response logs and extra diagnostics")
-    ap.add_argument("--throttle", type=float, default=2.0, help="Seconds delay between episode requests (default: 2.0)")
-    ap.add_argument(
-        "--fetch-profile",
-        choices=sorted(FETCH_PROFILES.keys()),
-        default="safe",
-        help="Download strategy profile (default: safe)",
-    )
+    ap.add_argument("--throttle", type=float, default=0.5, help="Seconds delay between episode requests (default: 0.5)")
+    ap.add_argument("--threads", type=int, default=1, help="Number of concurrent download threads (default: 1)")
     ap.add_argument("--txt", "-txt", action="store_true", help="Output plain .txt files per episode instead of EPUB")
     ap.add_argument("--novel-links-file", help="Read novel links/IDs from a text file and download them one by one")
     ap.add_argument("--batch-limit", type=int, default=0, help="Process at most N novels from --novel-links-file (0 = all)")
@@ -134,7 +145,8 @@ def main():
 
     const.HTTP_LOG = bool(args.debug)
 
-    if args.ui:
+    # Default to UI when no arguments given (e.g. double-clicking the .exe)
+    if args.ui or (not args.novel_id and not args.scrape_novel_links and not args.novel_links_file):
         launch_ui()
         return
 
@@ -199,7 +211,7 @@ def main():
             throttle=args.throttle,
             userkey=session_userkey,
             tkey=session_tkey,
-            fetch_profile=args.fetch_profile,
+            threads=args.threads,
         )
         client.login()
         # Persist/refresh tokens after successful login
@@ -227,7 +239,7 @@ def main():
             throttle=args.throttle,
             userkey=session_userkey,
             tkey=session_tkey,
-            fetch_profile=args.fetch_profile,
+            threads=args.threads,
         )
         client.tokens.login_at = session_login_at
         if args.save_session and (args.login_at or args.userkey or args.tkey or args.chrome_profile):
@@ -237,8 +249,14 @@ def main():
                 "tkey": session_tkey or "",
             })
     else:
-        print("[error] No credentials or stored tokens found. Provide --user/--pass or --login-at with --userkey.")
-        sys.exit(2)
+        print("[info] No credentials found. Running without login (free chapters only).")
+        client = NovelpiaClient(
+            email=None,
+            password=None,
+            proxy=args.proxy,
+            throttle=args.throttle,
+            threads=args.threads,
+        )
 
     if args.novel_links_file:
         try:
@@ -284,6 +302,8 @@ def main():
         sys.exit(1)
 
 if __name__ == "__main__":
+    import multiprocessing
+    multiprocessing.freeze_support()
     try:
         main()
     except KeyboardInterrupt:
