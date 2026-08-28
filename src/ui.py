@@ -26,6 +26,15 @@ ENV_PATH = APP_DIR / ".env"
 LOG_DIR = APP_DIR / "output" / "logs"
 
 
+def lock_spinbox_mouse_wheel(spinbox) -> None:
+    """Prevent page scrolling from accidentally changing a spinbox value."""
+    def block_mouse_wheel(_event=None):
+        return "break"
+
+    for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+        spinbox.bind(sequence, block_mouse_wheel)
+
+
 def launch_ui() -> None:
     # When frozen, ensure CWD is the exe's directory (not the temp extraction dir)
     if getattr(sys, 'frozen', False):
@@ -40,6 +49,13 @@ def launch_ui() -> None:
     env_cfg = dotenv_values(ENV_PATH) if ENV_PATH.exists() else {}
     chrome_profiles = list_chrome_profiles()
 
+    def config_number(key: str, default: float) -> float:
+        try:
+            value = cfg.get(key, default)
+            return float(default if value in (None, "") else value)
+        except (TypeError, ValueError):
+            return float(default)
+
     profile_var = tk.StringVar(value=(chrome_profiles[0] if chrome_profiles else ""))
     email_var = tk.StringVar(value=str(env_cfg.get("NOVELPIA_EMAIL") or ""))
     password_var = tk.StringVar(value=str(env_cfg.get("NOVELPIA_PASSWORD") or ""))
@@ -53,8 +69,15 @@ def launch_ui() -> None:
     txt_var = tk.BooleanVar(value=False)
     download_images_var = tk.BooleanVar(value=cfg.get("download_images", True) is not False)
     batch_links_var = tk.StringVar(value="output/novel_links.txt")
-    threads_var = tk.IntVar(value=int(cfg.get("threads") or 1))
-    interval_var = tk.DoubleVar(value=float(cfg.get("interval") or 0.5))
+    threads_var = tk.IntVar(value=max(1, int(config_number("threads", 1))))
+    legacy_interval = config_number("interval", 0.5)
+    configured_min_interval = config_number("min_interval", legacy_interval)
+    min_interval_var = tk.DoubleVar(value=configured_min_interval)
+    max_interval_var = tk.DoubleVar(
+        value=config_number("max_interval", max(2.0, configured_min_interval))
+    )
+    start_chapter_var = tk.IntVar(value=int(config_number("start_chapter", 0)))
+    end_chapter_var = tk.IntVar(value=int(config_number("end_chapter", 0)))
     scrape_out_var = tk.StringVar(value="output/novel_links.txt")
     scrape_images_var = tk.BooleanVar(value=bool(cfg.get("scrape_images", False)))
     page_start_var = tk.StringVar(value="1")
@@ -67,7 +90,6 @@ def launch_ui() -> None:
     current_log_path: Path | None = None
     was_cancelled = False
     cancel_event = threading.Event()
-    worker_thread: threading.Thread | None = None
 
     def set_status(text: str) -> None:
         status_var.set(text)
@@ -191,14 +213,54 @@ def launch_ui() -> None:
         append_log("[ui] UI focus restored. Attempting automatic Chrome import...\n")
         import_from_chrome()
 
+    def read_download_controls():
+        try:
+            start_chapter = int(start_chapter_var.get())
+            end_chapter = int(end_chapter_var.get())
+            min_interval = float(min_interval_var.get())
+            max_interval = float(max_interval_var.get())
+            threads = int(threads_var.get())
+        except (tk.TclError, TypeError, ValueError):
+            messagebox.showerror("Download settings", "Chapter, thread, and interval values must be numeric.")
+            return None
+
+        if start_chapter < 0 or end_chapter < 0:
+            messagebox.showerror("Chapter range", "Chapter values cannot be negative. Use 0 for no bound.")
+            return None
+        if start_chapter and end_chapter and start_chapter > end_chapter:
+            messagebox.showerror("Chapter range", "The start chapter cannot be greater than the end chapter.")
+            return None
+        if min_interval < 0 or max_interval < 0:
+            messagebox.showerror("Request interval", "Request intervals cannot be negative.")
+            return None
+        if min_interval > max_interval:
+            messagebox.showerror("Request interval", "The minimum interval cannot exceed the maximum interval.")
+            return None
+        if threads < 1:
+            messagebox.showerror("Download settings", "Threads must be at least 1.")
+            return None
+        return {
+            "start_chapter": start_chapter,
+            "end_chapter": end_chapter,
+            "min_interval": min_interval,
+            "max_interval": max_interval,
+            "threads": threads,
+        }
+
     def save_session_to_config() -> None:
+        settings = read_download_controls()
+        if settings is None:
+            return
         save_config(
             {
                 "login_at": login_at_var.get().strip(),
                 "userkey": userkey_var.get().strip(),
                 "tkey": tkey_var.get().strip(),
-                "threads": threads_var.get(),
-                "interval": interval_var.get(),
+                "threads": settings["threads"],
+                "min_interval": settings["min_interval"],
+                "max_interval": settings["max_interval"],
+                "start_chapter": settings["start_chapter"],
+                "end_chapter": settings["end_chapter"],
                 "download_images": download_images_var.get(),
                 "scrape_images": scrape_images_var.get(),
             }
@@ -279,7 +341,8 @@ def launch_ui() -> None:
                             import traceback
                             err = traceback.format_exc()
                             writer.write(f"\n[error] {err}\n")
-                            root.after(0, lambda: finish_run(1, str(e), success_message))
+                            error_message = str(e)
+                            root.after(0, lambda message=error_message: finish_run(1, message, success_message))
                         finally:
                             sys.stdout = old_stdout
                             sys.stderr = old_stderr
@@ -321,7 +384,8 @@ def launch_ui() -> None:
                 import traceback
                 err_msg = f"[error] Failed: {e}\n{traceback.format_exc()}\n"
                 log_queue.put(err_msg)
-                root.after(0, lambda: finish_run(1, str(e), success_message))
+                error_message = str(e)
+                root.after(0, lambda message=error_message: finish_run(1, message, success_message))
             finally:
                 current_process = None
 
@@ -388,14 +452,20 @@ def launch_ui() -> None:
         if not novel_id:
             messagebox.showerror("Download", "Please enter a novel ID.")
             return
+        settings = read_download_controls()
+        if settings is None:
+            return
 
         # Auto-save settings so they persist across sessions
         save_config({
             "login_at": login_at_var.get().strip(),
             "userkey": userkey_var.get().strip(),
             "tkey": tkey_var.get().strip(),
-            "threads": threads_var.get(),
-            "interval": interval_var.get(),
+            "threads": settings["threads"],
+            "min_interval": settings["min_interval"],
+            "max_interval": settings["max_interval"],
+            "start_chapter": settings["start_chapter"],
+            "end_chapter": settings["end_chapter"],
             "download_images": download_images_var.get(),
             "scrape_images": scrape_images_var.get(),
         })
@@ -415,7 +485,15 @@ def launch_ui() -> None:
             args.append("--txt")
         if not download_images_var.get():
             args.append("--no-images")
-        args += ["--threads", str(threads_var.get()), "--throttle", str(interval_var.get())]
+        if settings["start_chapter"]:
+            args += ["--start", str(settings["start_chapter"])]
+        if settings["end_chapter"]:
+            args += ["--end", str(settings["end_chapter"])]
+        args += [
+            "--threads", str(settings["threads"]),
+            "--min-interval", str(settings["min_interval"]),
+            "--max-interval", str(settings["max_interval"]),
+        ]
 
         mode = "TXT" if txt_var.get() else "EPUB"
         run_command(
@@ -443,6 +521,21 @@ def launch_ui() -> None:
         )
 
     def run_batch_download() -> None:
+        settings = read_download_controls()
+        if settings is None:
+            return
+        save_config({
+            "login_at": login_at_var.get().strip(),
+            "userkey": userkey_var.get().strip(),
+            "tkey": tkey_var.get().strip(),
+            "threads": settings["threads"],
+            "min_interval": settings["min_interval"],
+            "max_interval": settings["max_interval"],
+            "start_chapter": settings["start_chapter"],
+            "end_chapter": settings["end_chapter"],
+            "download_images": download_images_var.get(),
+            "scrape_images": scrape_images_var.get(),
+        })
         links_file = batch_links_var.get().strip() or "output/novel_links.txt"
         args = ["--novel-links-file", links_file, "--out", out_var.get().strip() or "output"]
         if email_var.get().strip():
@@ -459,7 +552,15 @@ def launch_ui() -> None:
             args.append("--txt")
         if not download_images_var.get():
             args.append("--no-images")
-        args += ["--threads", str(threads_var.get()), "--throttle", str(interval_var.get())]
+        if settings["start_chapter"]:
+            args += ["--start", str(settings["start_chapter"])]
+        if settings["end_chapter"]:
+            args += ["--end", str(settings["end_chapter"])]
+        args += [
+            "--threads", str(settings["threads"]),
+            "--min-interval", str(settings["min_interval"]),
+            "--max-interval", str(settings["max_interval"]),
+        ]
 
         mode = "TXT" if txt_var.get() else "EPUB"
         run_command(
@@ -624,40 +725,108 @@ def launch_ui() -> None:
     ttk.Label(download_tab, text="Batch links file").grid(row=2, column=0, sticky="w", pady=4)
     ttk.Entry(download_tab, textvariable=batch_links_var).grid(row=2, column=1, columnspan=2, sticky="ew", pady=4)
 
-    ttk.Label(download_tab, text="Threads").grid(row=3, column=0, sticky="w", pady=4)
-    ttk.Spinbox(download_tab, from_=1, to=10, textvariable=threads_var, width=5).grid(row=3, column=1, sticky="w", pady=4)
+    ttk.Label(download_tab, text="Chapter range").grid(row=3, column=0, sticky="w", pady=4)
+    chapter_range_frame = ttk.Frame(download_tab)
+    chapter_range_frame.grid(row=3, column=1, sticky="w", pady=4)
+    ttk.Label(chapter_range_frame, text="Start").grid(row=0, column=0, padx=(0, 4))
+    start_chapter_spinbox = ttk.Spinbox(
+        chapter_range_frame,
+        from_=0,
+        to=999999,
+        increment=1,
+        textvariable=start_chapter_var,
+        width=7,
+    )
+    start_chapter_spinbox.grid(row=0, column=1, padx=(0, 10))
+    ttk.Label(chapter_range_frame, text="End").grid(row=0, column=2, padx=(0, 4))
+    end_chapter_spinbox = ttk.Spinbox(
+        chapter_range_frame,
+        from_=0,
+        to=999999,
+        increment=1,
+        textvariable=end_chapter_var,
+        width=7,
+    )
+    end_chapter_spinbox.grid(row=0, column=3)
+    ttk.Label(
+        download_tab,
+        text="0 = first/last available chapter",
+        justify="left",
+    ).grid(row=3, column=2, sticky="w", padx=(12, 0), pady=4)
+
+    ttk.Label(download_tab, text="Threads").grid(row=4, column=0, sticky="w", pady=4)
+    threads_spinbox = ttk.Spinbox(
+        download_tab,
+        from_=1,
+        to=10,
+        textvariable=threads_var,
+        width=5,
+    )
+    threads_spinbox.grid(row=4, column=1, sticky="w", pady=4)
     ttk.Label(
         download_tab,
         text="Concurrent download workers (1 = sequential)",
         justify="left",
-    ).grid(row=3, column=2, sticky="w", padx=(12, 0), pady=4)
+    ).grid(row=4, column=2, sticky="w", padx=(12, 0), pady=4)
 
-    ttk.Label(download_tab, text="Interval (s)").grid(row=4, column=0, sticky="w", pady=4)
-    ttk.Spinbox(download_tab, from_=0.0, to=10.0, increment=0.1, textvariable=interval_var, width=5, format="%.1f").grid(row=4, column=1, sticky="w", pady=4)
+    ttk.Label(download_tab, text="Interval range (s)").grid(row=5, column=0, sticky="w", pady=4)
+    interval_range_frame = ttk.Frame(download_tab)
+    interval_range_frame.grid(row=5, column=1, sticky="w", pady=4)
+    ttk.Label(interval_range_frame, text="Min").grid(row=0, column=0, padx=(0, 4))
+    min_interval_spinbox = ttk.Spinbox(
+        interval_range_frame,
+        from_=0.0,
+        to=60.0,
+        increment=0.1,
+        textvariable=min_interval_var,
+        width=7,
+        format="%.1f",
+    )
+    min_interval_spinbox.grid(row=0, column=1, padx=(0, 10))
+    ttk.Label(interval_range_frame, text="Max").grid(row=0, column=2, padx=(0, 4))
+    max_interval_spinbox = ttk.Spinbox(
+        interval_range_frame,
+        from_=0.0,
+        to=60.0,
+        increment=0.1,
+        textvariable=max_interval_var,
+        width=7,
+        format="%.1f",
+    )
+    max_interval_spinbox.grid(row=0, column=3)
     ttk.Label(
         download_tab,
-        text="Delay between requests in seconds (0.5 recommended)",
+        text="A fresh random delay is used per chapter or concurrent batch",
         justify="left",
-    ).grid(row=4, column=2, sticky="w", padx=(12, 0), pady=4)
+    ).grid(row=5, column=2, sticky="w", padx=(12, 0), pady=4)
+
+    for spinbox in (
+        start_chapter_spinbox,
+        end_chapter_spinbox,
+        threads_spinbox,
+        min_interval_spinbox,
+        max_interval_spinbox,
+    ):
+        lock_spinbox_mouse_wheel(spinbox)
 
     ttk.Checkbutton(
         download_tab,
         text="Download cover and chapter images",
         variable=download_images_var,
-    ).grid(row=5, column=0, columnspan=3, sticky="w", pady=(8, 0))
+    ).grid(row=6, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
     ttk.Button(
         download_tab,
         text="Save Settings",
         command=save_session_to_config,
-    ).grid(row=6, column=0, sticky="w", pady=(12, 0))
+    ).grid(row=7, column=0, sticky="w", pady=(12, 0))
 
     cancel_btn = ttk.Button(download_tab, text="Cancel", command=cancel_run, state="disabled")
-    cancel_btn.grid(row=6, column=1, sticky="e", pady=(12, 0))
+    cancel_btn.grid(row=7, column=1, sticky="e", pady=(12, 0))
     batch_download_btn = ttk.Button(download_tab, text="Run Batch Download", command=run_batch_download)
-    batch_download_btn.grid(row=6, column=2, sticky="w", pady=(12, 0))
+    batch_download_btn.grid(row=7, column=2, sticky="w", pady=(12, 0))
     download_btn = ttk.Button(download_tab, text="Run Download", command=run_download)
-    download_btn.grid(row=6, column=2, sticky="e", pady=(12, 0))
+    download_btn.grid(row=7, column=2, sticky="e", pady=(12, 0))
 
     ttk.Label(scrape_tab, text="Page start").grid(row=0, column=0, sticky="w", pady=4)
     ttk.Entry(scrape_tab, textvariable=page_start_var).grid(row=0, column=1, sticky="ew", pady=4)

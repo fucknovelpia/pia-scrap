@@ -145,6 +145,8 @@ Important options:
 - `--out`
 - `--start`, `--end`
 - `--max-chapters`
+- `--min-interval`, `--max-interval`
+- `--throttle` (legacy fixed-delay override)
 - `--fetch-profile`
 - `--novel-links-file`
 - `--batch-limit`
@@ -173,6 +175,24 @@ Example:
 ```bash
 python3 main.py 49 --user you@example.com --pass "your-password" --fetch-profile fast-rotate
 ```
+
+## Chapter Range And Request Intervals
+
+Use an inclusive chapter range from the CLI:
+
+```bash
+python3 main.py 49 --start 20 --end 40
+```
+
+Sequential chapter requests, or pauses between concurrent batches, use a fresh
+random delay between 0.5 and 2.0 seconds by default. Set different bounds with:
+
+```bash
+python3 main.py 49 --min-interval 1.0 --max-interval 3.0
+```
+
+The legacy `--throttle 1.0` option remains available when a fixed delay is
+needed. It overrides both interval bounds.
 
 ## Public Novel Link Scraper
 
@@ -234,6 +254,9 @@ The desktop UI includes:
 - live log tab
 - single download
 - batch download from a links file
+- inclusive start/end chapter spinboxes
+- minimum/maximum random interval spinboxes (defaults: 0.5s and 2.0s)
+- mouse-wheel-locked spinboxes to prevent accidental changes while scrolling
 - cancel button
 - log files under `output/logs`
 

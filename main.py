@@ -134,7 +134,9 @@ def main():
     ap.add_argument("--lang", default="en", help="EPUB language code (default: en)")
     ap.add_argument("--proxy", default=None, help="HTTP/HTTPS proxy, e.g. http://host:port")
     ap.add_argument("--debug", "-v", action="store_true", help="Enable verbose HTTP request/response logs and extra diagnostics")
-    ap.add_argument("--throttle", type=float, default=0.5, help="Seconds delay between episode requests (default: 0.5)")
+    ap.add_argument("--min-interval", type=float, default=0.5, help="Minimum random delay between episode requests (default: 0.5s)")
+    ap.add_argument("--max-interval", type=float, default=2.0, help="Maximum random delay between episode requests (default: 2.0s)")
+    ap.add_argument("--throttle", type=float, default=None, help="Legacy fixed delay; overrides --min-interval and --max-interval")
     ap.add_argument("--threads", type=int, default=1, help="Number of concurrent download threads (default: 1)")
     ap.add_argument("--txt", "-txt", action="store_true", help="Output plain .txt files per episode instead of EPUB")
     ap.add_argument("--no-images", action="store_true", help="Skip cover and chapter image downloads")
@@ -147,6 +149,23 @@ def main():
     ap.add_argument("--scrape-images", action="store_true", help="Download cover thumbnails found while scraping public novel lists")
     ap.add_argument("--scrape-images-dir", help="Directory for listing images (default: <links-out name>_images)")
     args = ap.parse_args()
+
+    if args.start_chapter is not None and args.start_chapter < 1:
+        ap.error("--start must be at least 1")
+    if args.end_chapter is not None and args.end_chapter < 1:
+        ap.error("--end must be at least 1")
+    if (
+        args.start_chapter is not None
+        and args.end_chapter is not None
+        and args.start_chapter > args.end_chapter
+    ):
+        ap.error("--start cannot be greater than --end")
+    if args.throttle is not None and args.throttle < 0:
+        ap.error("--throttle cannot be negative")
+    if args.min_interval < 0 or args.max_interval < 0:
+        ap.error("request intervals cannot be negative")
+    if args.min_interval > args.max_interval:
+        ap.error("--min-interval cannot be greater than --max-interval")
 
     const.HTTP_LOG = bool(args.debug)
 
@@ -216,6 +235,8 @@ def main():
             password=password,
             proxy=args.proxy,
             throttle=args.throttle,
+            min_interval=args.min_interval,
+            max_interval=args.max_interval,
             userkey=session_userkey,
             tkey=session_tkey,
             threads=args.threads,
@@ -244,6 +265,8 @@ def main():
             password=None,
             proxy=args.proxy,
             throttle=args.throttle,
+            min_interval=args.min_interval,
+            max_interval=args.max_interval,
             userkey=session_userkey,
             tkey=session_tkey,
             threads=args.threads,
@@ -262,6 +285,8 @@ def main():
             password=None,
             proxy=args.proxy,
             throttle=args.throttle,
+            min_interval=args.min_interval,
+            max_interval=args.max_interval,
             threads=args.threads,
         )
 

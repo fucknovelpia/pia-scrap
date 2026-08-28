@@ -219,3 +219,11 @@ What it adds:
 - content-hash deduplication and reuse across rebuilds
 - offline EPUB embedding and local image markers in TXT chapters
 - optional listing-thumbnail downloads from both the CLI and desktop UI
+
+## 15. Chapter Range And Random Intervals
+
+Added inclusive start/end chapter controls to the Download tab and replaced the
+single fixed interval with minimum/maximum controls. Each sequential chapter
+request or concurrent batch pause now uses a fresh random value in the configured range,
+which defaults to 0.5-2.0 seconds. Download-tab spinboxes ignore mouse-wheel
+events to prevent accidental value changes while scrolling.

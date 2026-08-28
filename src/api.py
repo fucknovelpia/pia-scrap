@@ -31,9 +31,10 @@ class Tokens:
 
 class NovelpiaClient:
     def __init__(self, email: Optional[str] = None, password: Optional[str] = None,
-                 proxy: Optional[str] = None, timeout: int = 30, throttle: float = 0.5,
+                 proxy: Optional[str] = None, timeout: int = 30, throttle: Optional[float] = None,
                  userkey: Optional[str] = None, tkey: Optional[str] = None,
-                 threads: int = 1):
+                 threads: int = 1, min_interval: Optional[float] = None,
+                 max_interval: Optional[float] = None):
         self.s = requests.Session()
         self.s.headers.update(const.SESSION_HEADERS.copy())
         if proxy:
@@ -42,8 +43,20 @@ class NovelpiaClient:
         self.tokens = Tokens()
         self.email = email
         self.password = password
-        # delay seconds between episode-related API calls to reduce 429/500 rate limits
-        self.throttle = max(0.0, float(throttle or 0.5))
+        # Random delay range between episode-related API calls. A supplied
+        # legacy `throttle` value intentionally creates a fixed interval.
+        if throttle is not None:
+            interval_min = interval_max = float(throttle)
+        else:
+            interval_min = 0.5 if min_interval is None else float(min_interval)
+            interval_max = 2.0 if max_interval is None else float(max_interval)
+        if interval_min < 0 or interval_max < 0:
+            raise ValueError("Request intervals cannot be negative.")
+        if interval_min > interval_max:
+            raise ValueError("Minimum request interval cannot exceed maximum request interval.")
+        self.interval_min = interval_min
+        self.interval_max = interval_max
+        self._suppress_request_interval = False
         self.chapter_counter = 0
         self.default_max_workers = max(1, int(threads or 1))
         self.recover_attempts = 2
@@ -64,6 +77,32 @@ class NovelpiaClient:
                 self.tokens.tkey = tkey
         except Exception as e:
             print(f"Error setting cookies: {e}")
+
+    @property
+    def throttle(self) -> float:
+        """Backward-compatible fixed-throttle view (returns the upper bound)."""
+        return self.interval_max
+
+    @throttle.setter
+    def throttle(self, value: float) -> None:
+        fixed = max(0.0, float(value))
+        self.interval_min = fixed
+        self.interval_max = fixed
+
+    def _next_request_interval(self) -> float:
+        if self.interval_min == self.interval_max:
+            return self.interval_min
+        return random.uniform(self.interval_min, self.interval_max)
+
+    def _sleep_request_interval(self, force: bool = False) -> float:
+        if self._suppress_request_interval and not force:
+            return 0.0
+        delay = self._next_request_interval()
+        if delay > 0:
+            if const.HTTP_LOG:
+                print(f"[api] Waiting {delay:.2f}s before the next episode request.")
+            time.sleep(delay)
+        return delay
 
 
 
@@ -118,11 +157,17 @@ class NovelpiaClient:
         return self.tokens.login_at
 
     def _on_rate_limit(self):
-        """Increase throttle when 429 occurs."""
-        old = self.throttle
-        self.throttle = min(15.0, self.throttle + 1.5)
+        """Increase both interval bounds when a 429 response occurs."""
+        old_min = self.interval_min
+        old_max = self.interval_max
+        self.interval_min = min(15.0, self.interval_min + 1.5)
+        self.interval_max = min(15.0, max(self.interval_min, self.interval_max + 1.5))
         if const.HTTP_LOG:
-            print(f"[api] Increased throttle from {old}s to {self.throttle}s due to rate limit.")
+            print(
+                "[api] Increased request interval from "
+                f"{old_min:.2f}-{old_max:.2f}s to "
+                f"{self.interval_min:.2f}-{self.interval_max:.2f}s due to rate limit."
+            )
 
     def me(self) -> Dict:
         url = f"{const.API_BASE}/v1/login/me"
@@ -170,9 +215,8 @@ class NovelpiaClient:
         url = f"{const.API_BASE}/v1/novel/episode"
         headers = merge_login_at({}, self.tokens.login_at)
         params = {"episode_no": episode_no}
-        # Throttle before hitting ticket endpoint to avoid rate limits
-        if self.throttle:
-            time.sleep(self.throttle)
+        # Randomized pause before the ticket endpoint to avoid rate limits.
+        self._sleep_request_interval()
         r = request_with_retries(
             self.s, "GET", url,
             headers=headers, params=params,
@@ -298,82 +342,88 @@ class NovelpiaClient:
         """Fetch episodes in batches of max_workers, like NpiaDownloader67.
 
         Each batch submits max_workers chapters simultaneously with no
-        per-request throttle inside the batch. The throttle delay is applied
+        per-worker pause inside the batch. A random interval is applied
         between batches instead, preventing rate limits while maximising
         throughput.
         """
-        print(f"[info] Fetching with {max_workers} concurrent workers, {self.throttle}s delay between batches.")
+        print(
+            f"[info] Fetching with {max_workers} concurrent workers, "
+            f"{self.interval_min:.1f}-{self.interval_max:.1f}s random delay between batches."
+        )
         total = len(ep_list)
         results: List[Dict[str, Any]] = [{} for _ in range(total)]
         num_batches = (total + max_workers - 1) // max_workers
 
-        # Temporarily disable per-request throttle since we throttle between batches
-        saved_throttle = self.throttle
+        # Suppress per-worker pauses inside a concurrent batch. A fresh random
+        # pause from the configured range is applied between batches instead.
+        saved_suppression = self._suppress_request_interval
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            for batch_start in range(0, total, max_workers):
-                batch = ep_list[batch_start:batch_start + max_workers]
-                batch_indices = list(range(batch_start, batch_start + len(batch)))
-                batch_num = batch_start // max_workers + 1
-                ch_ids = [i + 1 for i in batch_indices]
-                batch_t0 = time.time()
-                print(f"[batch {batch_num}/{num_batches}] Downloading Ch.{ch_ids[0]}-{ch_ids[-1]} ({len(batch)} chapters)...")
+        try:
+            self._suppress_request_interval = True
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                for batch_start in range(0, total, max_workers):
+                    batch = ep_list[batch_start:batch_start + max_workers]
+                    batch_indices = list(range(batch_start, batch_start + len(batch)))
+                    batch_num = batch_start // max_workers + 1
+                    ch_ids = [i + 1 for i in batch_indices]
+                    batch_t0 = time.time()
+                    print(f"[batch {batch_num}/{num_batches}] Downloading Ch.{ch_ids[0]}-{ch_ids[-1]} ({len(batch)} chapters)...")
 
-                # Submit batch — no throttle inside batch for true parallelism
-                self.throttle = 0
-                future_map = {}
-                for i, ep in zip(batch_indices, batch):
-                    idx = i + 1  # 1-based
-                    future_map[executor.submit(self.fetch_episode, ep, idx)] = (idx, ep)
+                    # Submit the batch with per-worker pauses suppressed.
+                    future_map = {}
+                    for i, ep in zip(batch_indices, batch):
+                        idx = i + 1  # 1-based
+                        future_map[executor.submit(self.fetch_episode, ep, idx)] = (idx, ep)
 
-                # Wait for batch to complete
-                for future in concurrent.futures.as_completed(future_map):
-                    if cancel_event.is_set():
-                        # Cancel remaining futures
-                        for f in future_map:
-                            f.cancel()
-                        raise KeyboardInterrupt("Cancelled by user")
-                    idx, ep = future_map[future]
-                    try:
-                        res = future.result()
-                    except Exception as e:
-                        res = {"error": str(e), "idx": idx}
-
-                    if (not res) or ("error" in res):
+                    # Wait for batch to complete
+                    for future in concurrent.futures.as_completed(future_map):
                         if cancel_event.is_set():
+                            # Cancel remaining futures
+                            for f in future_map:
+                                f.cancel()
                             raise KeyboardInterrupt("Cancelled by user")
-                        err = res.get("error") if res else "Unknown error"
-                        print(f"[warn] Chapter {idx} failed: {err}")
-                        self.throttle = saved_throttle
-                        res = self._recover_episode(ep, idx)
-                        self.throttle = 0
+                        idx, ep = future_map[future]
+                        try:
+                            res = future.result()
+                        except Exception as e:
+                            res = {"error": str(e), "idx": idx}
 
-                    results[idx - 1] = res
-                    if progress_cb:
-                        ok = bool(res) and "error" not in res
-                        progress_cb(idx, ok, res)
+                        if (not res) or ("error" in res):
+                            if cancel_event.is_set():
+                                raise KeyboardInterrupt("Cancelled by user")
+                            err = res.get("error") if res else "Unknown error"
+                            print(f"[warn] Chapter {idx} failed: {err}")
+                            self._suppress_request_interval = False
+                            res = self._recover_episode(ep, idx)
+                            self._suppress_request_interval = True
 
-                batch_elapsed = time.time() - batch_t0
-                print(f"[batch {batch_num}/{num_batches}] Done in {batch_elapsed:.1f}s")
+                        results[idx - 1] = res
+                        if progress_cb:
+                            ok = bool(res) and "error" not in res
+                            progress_cb(idx, ok, res)
 
-                # Check for cancellation
-                if cancel_event.is_set():
-                    print("[info] Download cancelled by user.")
-                    raise KeyboardInterrupt("Cancelled by user")
+                    batch_elapsed = time.time() - batch_t0
+                    print(f"[batch {batch_num}/{num_batches}] Done in {batch_elapsed:.1f}s")
 
-                # Throttle between batches
-                if batch_start + max_workers < total:
-                    time.sleep(saved_throttle)
+                    # Check for cancellation
+                    if cancel_event.is_set():
+                        print("[info] Download cancelled by user.")
+                        raise KeyboardInterrupt("Cancelled by user")
 
-        self.throttle = saved_throttle
+                    if batch_start + max_workers < total:
+                        self._sleep_request_interval(force=True)
+        finally:
+            self._suppress_request_interval = saved_suppression
         return results
 
     def _recover_episode(self, ep: Dict[str, Any], idx: int) -> Dict[str, Any]:
         if cancel_event.is_set():
             return {"error": "cancelled", "idx": idx}
-        old_throttle = self.throttle
+        old_interval_min = self.interval_min
+        old_interval_max = self.interval_max
         retry_res: Optional[Dict[str, Any]] = None
-        self.throttle = min(10.0, max(self.throttle + 1.0, self.recover_throttle))
+        self.interval_min = min(10.0, max(self.interval_min + 1.0, self.recover_throttle))
+        self.interval_max = min(10.0, max(self.interval_max + 1.0, self.interval_min))
         try:
             for attempt in range(1, self.recover_attempts + 1):
                 if cancel_event.is_set():
@@ -414,7 +464,8 @@ class NovelpiaClient:
 
             return retry_res if retry_res else {"error": "recovery failed", "idx": idx}
         finally:
-            self.throttle = old_throttle
+            self.interval_min = old_interval_min
+            self.interval_max = old_interval_max
 
 
 def describe_http_error(resp: requests.Response) -> str:
@@ -537,29 +588,34 @@ def request_with_retries(session: requests.Session, method: str, url: str, *,
                         success = False
                         # Try refresh first
                         if refresh_fn and not did_refresh:
-                            if const.HTTP_LOG: print("[api] Session expired, trying refresh...")
+                            if const.HTTP_LOG:
+                                print("[api] Session expired, trying refresh...")
                             try:
                                 refresh_fn()
                                 did_refresh = True
                                 success = True
                             except Exception:
-                                if const.HTTP_LOG: print("[api] Refresh failed.")
+                                if const.HTTP_LOG:
+                                    print("[api] Refresh failed.")
                         
                         # Try full login if refresh failed or not available
                         if not success and login_fn and not did_login:
-                            if const.HTTP_LOG: print("[api] Refresh failed or unavailable, trying full re-login...")
+                            if const.HTTP_LOG:
+                                print("[api] Refresh failed or unavailable, trying full re-login...")
                             try:
                                 login_fn()
                                 did_login = True
                                 success = True
                             except Exception as e:
-                                if const.HTTP_LOG: print(f"[api] Re-login failed: {e}")
+                                if const.HTTP_LOG:
+                                    print(f"[api] Re-login failed: {e}")
 
                         if success:
                             # Retry original request once
                             r = session.request(method, url, headers=headers, params=params, json=json, data=data, timeout=timeout)
                     except Exception as e:
-                        if const.HTTP_LOG: print(f"[api] Auth recovery failed: {e}")
+                        if const.HTTP_LOG:
+                            print(f"[api] Auth recovery failed: {e}")
 
             if r.json and r.status_code >= 500 and attempt < max_retries:
                 time.sleep(backoff ** attempt)
