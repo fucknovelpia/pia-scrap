@@ -207,3 +207,15 @@ Compared to the original version, this cleaned project now supports:
 - richer EPUB metadata
 - reusable local cache for updates
 - easier sharing as a public repository
+
+## 14. Complete Image Pipeline
+
+Added shared image handling across EPUB, TXT, and public-list scraping.
+
+What it adds:
+- cover, inline, lazy-loaded, responsive, and CSS background image discovery
+- authenticated downloads with payload validation, retries, and size limits
+- persistent `images/` assets and an `images.json` inventory
+- content-hash deduplication and reuse across rebuilds
+- offline EPUB embedding and local image markers in TXT chapters
+- optional listing-thumbnail downloads from both the CLI and desktop UI

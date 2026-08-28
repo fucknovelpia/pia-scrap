@@ -19,6 +19,8 @@ Compared to the original script, this version includes:
 - batch mode from `novel_links.txt`
 - richer EPUB metadata
 - per-novel cache and update-friendly rebuilds
+- persistent, deduplicated cover and chapter image downloads
+- optional cover-thumbnail downloads in public-list scraping
 - safer recovery logic and selectable download profiles
 
 See [ADDED_FEATURES.md](./ADDED_FEATURES.md) for a detailed changelog of the added functionality.
@@ -139,6 +141,7 @@ Important options:
 - `--save-session`
 - `--ui`
 - `--txt`
+- `--no-images`
 - `--out`
 - `--start`, `--end`
 - `--max-chapters`
@@ -147,6 +150,7 @@ Important options:
 - `--batch-limit`
 - `--scrape-novel-links`
 - `--page-start`, `--page-end`, `--links-out`
+- `--scrape-images`, `--scrape-images-dir`
 
 ## Download Profiles
 
@@ -185,6 +189,17 @@ Output lines look like:
 ```text
 https://global.novelpia.com/novel/3183
 ```
+
+Download the cover thumbnails found on those listing pages at the same time:
+
+```bash
+python3 main.py --scrape-novel-links --page-start 1 --page-end 63 \
+  --links-out output/novel_links.txt --scrape-images
+```
+
+The default thumbnail directory is `output/novel_links_images/`. Override it
+with `--scrape-images-dir PATH`. Its `images.json` file maps each saved,
+content-deduplicated image back to the associated novel URL.
 
 ## Batch Download
 
@@ -232,6 +247,8 @@ output/<title>/
 
 Typical files:
 - `<title>.epub`
+- `images/<content-hash>.<extension>`
+- `images.json`
 - `metadata.json`
 - `chapters.jsonl`
 - `build_state.json`
@@ -260,6 +277,27 @@ Generated EPUBs include:
 - `About` page
 
 Inline chapter images are also downloaded and embedded when accessible.
+
+## Image Support
+
+Image downloads are enabled by default for EPUB and TXT builds. The downloader:
+
+- saves the novel cover and inline chapter images under `images/`
+- recognizes regular, lazy-loaded, responsive `srcset`, `<picture>`, inline
+  background, stylesheet, protocol-relative, relative, and `data:` image sources
+- validates the actual payload instead of trusting its URL extension
+- supports JPEG, PNG, GIF, WebP, SVG, and AVIF
+- uses the authenticated Novelpia session and viewer referrer when fetching assets
+- retries temporary failures, enforces a 25 MiB per-image limit, and reports failures
+- deduplicates identical content and reuses it on later builds
+- records sources, roles, chapters, sizes, hashes, and failures in `images.json`
+
+EPUB builds embed the downloaded assets for offline reading. TXT files cannot
+embed binary data, so they contain an `[Image: ... (images/...)]` marker at the
+original location and keep the corresponding file beside the chapters.
+
+Use `--no-images` to skip all cover and chapter image downloads. The desktop UI
+exposes the same novel-image and listing-thumbnail controls.
 
 ## Notes
 

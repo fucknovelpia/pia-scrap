@@ -1,5 +1,5 @@
 from bs4 import BeautifulSoup
-from src.helper import normalize_url
+from src.images import normalize_image_tags
 
 # ----------------------------
 # Novelpia Novel & Episodes Fetcher
@@ -8,14 +8,9 @@ from src.helper import normalize_url
 def html_from_episode_text(raw_html: str) -> str:
     soup = BeautifulSoup(raw_html or "", "html.parser")
 
-    # normalize images
-    for img in soup.find_all("img"):
-        if img.get("data-src") and not img.get("src"):
-            img["src"] = img["data-src"]
-        if "style" in img.attrs:
-            del img["style"]
-        if img.get("src"):
-            img["src"] = normalize_url(img["src"])
+    # Normalize lazy and responsive sources early, while preserving inline styles
+    # so background images can be localized by the output builder.
+    normalize_image_tags(soup)
 
     # Ensure document wrapper
     if not soup.find("html"):

@@ -51,10 +51,12 @@ def launch_ui() -> None:
     novel_id_var = tk.StringVar()
     out_var = tk.StringVar(value="output")
     txt_var = tk.BooleanVar(value=False)
+    download_images_var = tk.BooleanVar(value=cfg.get("download_images", True) is not False)
     batch_links_var = tk.StringVar(value="output/novel_links.txt")
     threads_var = tk.IntVar(value=int(cfg.get("threads") or 1))
     interval_var = tk.DoubleVar(value=float(cfg.get("interval") or 0.5))
     scrape_out_var = tk.StringVar(value="output/novel_links.txt")
+    scrape_images_var = tk.BooleanVar(value=bool(cfg.get("scrape_images", False)))
     page_start_var = tk.StringVar(value="1")
     page_end_var = tk.StringVar(value="63")
     status_var = tk.StringVar(value="Ready.")
@@ -197,6 +199,8 @@ def launch_ui() -> None:
                 "tkey": tkey_var.get().strip(),
                 "threads": threads_var.get(),
                 "interval": interval_var.get(),
+                "download_images": download_images_var.get(),
+                "scrape_images": scrape_images_var.get(),
             }
         )
         set_status("Saved session to .api.json.")
@@ -392,6 +396,8 @@ def launch_ui() -> None:
             "tkey": tkey_var.get().strip(),
             "threads": threads_var.get(),
             "interval": interval_var.get(),
+            "download_images": download_images_var.get(),
+            "scrape_images": scrape_images_var.get(),
         })
 
         args = [novel_id, "--out", out_var.get().strip() or "output"]
@@ -407,6 +413,8 @@ def launch_ui() -> None:
             args += ["--tkey", tkey_var.get().strip()]
         if txt_var.get():
             args.append("--txt")
+        if not download_images_var.get():
+            args.append("--no-images")
         args += ["--threads", str(threads_var.get()), "--throttle", str(interval_var.get())]
 
         mode = "TXT" if txt_var.get() else "EPUB"
@@ -426,6 +434,8 @@ def launch_ui() -> None:
             "--links-out",
             scrape_out_var.get().strip() or "output/novel_links.txt",
         ]
+        if scrape_images_var.get():
+            args.append("--scrape-images")
         run_command(
             args,
             "Finished scraping novel links.",
@@ -447,6 +457,8 @@ def launch_ui() -> None:
             args += ["--tkey", tkey_var.get().strip()]
         if txt_var.get():
             args.append("--txt")
+        if not download_images_var.get():
+            args.append("--no-images")
         args += ["--threads", str(threads_var.get()), "--throttle", str(interval_var.get())]
 
         mode = "TXT" if txt_var.get() else "EPUB"
@@ -628,18 +640,24 @@ def launch_ui() -> None:
         justify="left",
     ).grid(row=4, column=2, sticky="w", padx=(12, 0), pady=4)
 
+    ttk.Checkbutton(
+        download_tab,
+        text="Download cover and chapter images",
+        variable=download_images_var,
+    ).grid(row=5, column=0, columnspan=3, sticky="w", pady=(8, 0))
+
     ttk.Button(
         download_tab,
         text="Save Settings",
         command=save_session_to_config,
-    ).grid(row=5, column=0, sticky="w", pady=(12, 0))
+    ).grid(row=6, column=0, sticky="w", pady=(12, 0))
 
     cancel_btn = ttk.Button(download_tab, text="Cancel", command=cancel_run, state="disabled")
-    cancel_btn.grid(row=5, column=1, sticky="e", pady=(12, 0))
+    cancel_btn.grid(row=6, column=1, sticky="e", pady=(12, 0))
     batch_download_btn = ttk.Button(download_tab, text="Run Batch Download", command=run_batch_download)
-    batch_download_btn.grid(row=5, column=2, sticky="w", pady=(12, 0))
+    batch_download_btn.grid(row=6, column=2, sticky="w", pady=(12, 0))
     download_btn = ttk.Button(download_tab, text="Run Download", command=run_download)
-    download_btn.grid(row=5, column=2, sticky="e", pady=(12, 0))
+    download_btn.grid(row=6, column=2, sticky="e", pady=(12, 0))
 
     ttk.Label(scrape_tab, text="Page start").grid(row=0, column=0, sticky="w", pady=4)
     ttk.Entry(scrape_tab, textvariable=page_start_var).grid(row=0, column=1, sticky="ew", pady=4)
@@ -650,8 +668,14 @@ def launch_ui() -> None:
     ttk.Label(scrape_tab, text="Links output").grid(row=2, column=0, sticky="w", pady=4)
     ttk.Entry(scrape_tab, textvariable=scrape_out_var).grid(row=2, column=1, columnspan=2, sticky="ew", pady=4)
 
+    ttk.Checkbutton(
+        scrape_tab,
+        text="Download listing cover images",
+        variable=scrape_images_var,
+    ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(8, 0))
+
     scrape_btn = ttk.Button(scrape_tab, text="Run Link Scrape", command=run_link_scrape)
-    scrape_btn.grid(row=3, column=2, sticky="e", pady=(12, 0))
+    scrape_btn.grid(row=4, column=2, sticky="e", pady=(12, 0))
 
     ttk.Label(log_tab, text="Live Log").grid(row=0, column=0, sticky="w", pady=(0, 6))
     log_text = tk.Text(log_tab, height=18, wrap="word", state="disabled")

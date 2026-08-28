@@ -51,13 +51,15 @@ def run_single_build(client, args, novel_id: int):
             end_chapter=args.end_chapter,
             max_chapters=(args.max_chapters if args.max_chapters and args.max_chapters > 0 else None),
             language=args.lang, debug_dump=args.debug,
+            download_images=not args.no_images,
         )
     return build_epub(
         client, novel_id, args.out,
         start_chapter=args.start_chapter,
         end_chapter=args.end_chapter,
         max_chapters=(args.max_chapters if args.max_chapters and args.max_chapters > 0 else None),
-        language=args.lang, debug_dump=args.debug
+        language=args.lang, debug_dump=args.debug,
+        download_images=not args.no_images,
     )
 
 
@@ -115,7 +117,7 @@ def parse_novel_id(value: str) -> int:
 
 def main():
     load_dotenv()
-    ap = argparse.ArgumentParser(description="Novelpia → EPUB packer (API)")
+    ap = argparse.ArgumentParser(description="Novelpia to EPUB packer (API)")
     ap.add_argument("novel_id", type=parse_novel_id, nargs="?", help="Novel ID or URL (e.g., 1072 or https://global.novelpia.com/novel/1072)")
     ap.add_argument("--ui", action="store_true", help="Launch the desktop UI")
     ap.add_argument("--user", "--email", "-u", "-e", dest="email", help="Novelpia email (overrides config tokens if provided)")
@@ -135,12 +137,15 @@ def main():
     ap.add_argument("--throttle", type=float, default=0.5, help="Seconds delay between episode requests (default: 0.5)")
     ap.add_argument("--threads", type=int, default=1, help="Number of concurrent download threads (default: 1)")
     ap.add_argument("--txt", "-txt", action="store_true", help="Output plain .txt files per episode instead of EPUB")
+    ap.add_argument("--no-images", action="store_true", help="Skip cover and chapter image downloads")
     ap.add_argument("--novel-links-file", help="Read novel links/IDs from a text file and download them one by one")
     ap.add_argument("--batch-limit", type=int, default=0, help="Process at most N novels from --novel-links-file (0 = all)")
     ap.add_argument("--scrape-novel-links", action="store_true", help="Scrape novel links from the public novel list pages")
     ap.add_argument("--page-start", type=int, default=1, help="Start page for --scrape-novel-links (default: 1)")
     ap.add_argument("--page-end", type=int, default=63, help="End page for --scrape-novel-links (default: 63)")
     ap.add_argument("--links-out", default="output/novel_links.txt", help="Output file for --scrape-novel-links")
+    ap.add_argument("--scrape-images", action="store_true", help="Download cover thumbnails found while scraping public novel lists")
+    ap.add_argument("--scrape-images-dir", help="Directory for listing images (default: <links-out name>_images)")
     args = ap.parse_args()
 
     const.HTTP_LOG = bool(args.debug)
@@ -156,6 +161,8 @@ def main():
                 start_page=args.page_start,
                 end_page=args.page_end,
                 out_file=args.links_out,
+                download_images=args.scrape_images,
+                image_dir=args.scrape_images_dir,
             )
             print(
                 f"[success] Wrote {len(links)} novel links to: {args.links_out}"
