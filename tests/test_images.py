@@ -132,6 +132,38 @@ class ImageManagerTests(unittest.TestCase):
             self.assertEqual(manager.summary()["image_count"], 0)
             self.assertEqual(manager.summary()["image_failures"], 1)
 
+    def test_forwards_signed_cookies_for_protected_image(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session = FakeSession()
+            manager = ImageManager(session, temp_dir)
+            cookies = {
+                "CloudFront-Policy": "policy",
+                "CloudFront-Key-Pair-Id": "key",
+                "CloudFront-Signature": "signature",
+            }
+            localized, assets = manager.localize_html(
+                '<img src="https://pv-gn.novelpia.com/novel/1/2/panel.png">',
+                episode_no=2,
+                request_cookies=cookies,
+            )
+            self.assertEqual(len(assets), 1)
+            self.assertEqual(session.calls[0][1]["cookies"], cookies)
+            self.assertIn("images/", localized)
+
+    def test_failed_image_becomes_placeholder_not_broken_remote_url(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = ImageManager(
+                FakeSession(FakeResponse(payload=b"denied", content_type="text/xml", status_code=403)),
+                temp_dir,
+            )
+            localized, assets = manager.localize_html(
+                '<p><img src="https://example.test/denied.png" alt="Illustration"></p>'
+            )
+            self.assertEqual(assets, [])
+            self.assertNotIn("<img", localized)
+            self.assertNotIn("https://example.test/denied.png", localized)
+            self.assertIn("[Illustration]", localized)
+
 
 if __name__ == "__main__":
     unittest.main()

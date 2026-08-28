@@ -278,7 +278,12 @@ class ImageManager:
             size=int(record["bytes"]),
         )
 
-    def _fetch(self, source_url: str, referer: Optional[str]) -> Tuple[bytes, str]:
+    def _fetch(
+        self,
+        source_url: str,
+        referer: Optional[str],
+        request_cookies: Optional[Dict[str, str]] = None,
+    ) -> Tuple[bytes, str]:
         if source_url.startswith("data:"):
             return _decode_data_url(source_url)
         if source_url.startswith("blob:"):
@@ -300,6 +305,7 @@ class ImageManager:
                 response = self.session.get(
                     source_url,
                     headers=headers,
+                    cookies=request_cookies or None,
                     timeout=self.timeout,
                     stream=True,
                 )
@@ -353,6 +359,7 @@ class ImageManager:
         alt_text: Optional[str] = None,
         referer: Optional[str] = None,
         base_url: str = BASE_URL,
+        request_cookies: Optional[Dict[str, str]] = None,
     ) -> Optional[ImageAsset]:
         source_url = normalize_image_url(source_url, base_url)
         if not source_url:
@@ -371,11 +378,11 @@ class ImageManager:
             )
             self.reused_this_run += 1
             return self._asset_from_record(record)
-        if source_url in self.failures:
+        if source_url in self.failures and not request_cookies:
             return None
 
         try:
-            payload, response_type = self._fetch(source_url, referer)
+            payload, response_type = self._fetch(source_url, referer, request_cookies)
             media_type, extension = detect_image_format(payload, response_type, source_url)
         except Exception as exc:
             display_source = source_url if len(source_url) <= 500 else source_url[:497] + "..."
@@ -387,6 +394,10 @@ class ImageManager:
                 "context": context,
             }
             return None
+
+        # A successful authenticated retry supersedes an earlier failure for
+        # the same protected URL.
+        self.failures.pop(source_url, None)
 
         digest = hashlib.sha256(payload).hexdigest()
         record = self.assets.get(digest)
@@ -441,6 +452,7 @@ class ImageManager:
         context: Optional[str] = None,
         referer: Optional[str] = None,
         base_url: str = BASE_URL,
+        request_cookies: Optional[Dict[str, str]] = None,
     ) -> Tuple[str, List[ImageAsset]]:
         soup = BeautifulSoup(html_text or "", "html.parser")
         used: Dict[str, ImageAsset] = {}
@@ -456,12 +468,18 @@ class ImageManager:
                 alt_text=alt_text,
                 referer=referer,
                 base_url=base_url,
+                request_cookies=request_cookies,
             )
             if asset:
                 image["src"] = asset.relative_path
                 used[asset.sha256] = asset
-            elif source_url:
-                image["src"] = source_url
+            else:
+                label = alt_text or "Image unavailable"
+                placeholder = soup.new_tag("span")
+                placeholder["class"] = "missing-image"
+                placeholder.string = f"[{label}]"
+                image.replace_with(placeholder)
+                continue
             self._strip_remote_candidates(image)
 
         for element in soup.find_all(style=True):
@@ -476,9 +494,10 @@ class ImageManager:
                     context=context,
                     referer=referer,
                     base_url=base_url,
+                    request_cookies=request_cookies,
                 )
                 if not asset:
-                    return match.group(0)
+                    return "none"
                 used[asset.sha256] = asset
                 return f"url('{asset.relative_path}')"
 
@@ -498,9 +517,10 @@ class ImageManager:
                     context=context,
                     referer=referer,
                     base_url=base_url,
+                    request_cookies=request_cookies,
                 )
                 if not asset:
-                    return match.group(0)
+                    return "none"
                 used[asset.sha256] = asset
                 return f"url('{asset.relative_path}')"
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import multiprocessing
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -24,6 +25,49 @@ from src.helper import load_config, save_config
 CHROME_BINARY = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 ENV_PATH = APP_DIR / ".env"
 LOG_DIR = APP_DIR / "output" / "logs"
+TEMP_BATCH_PREFIX = "pia-scrap-batch-"
+NOVEL_PATH_RE = re.compile(r"/novel/(\d+)", re.IGNORECASE)
+
+
+def parse_pasted_novel_entries(text: str) -> list[str]:
+    """Return deduplicated novel IDs from pasted URLs or raw IDs."""
+    entries: list[str] = []
+    seen: set[str] = set()
+    for raw_token in re.split(r"[\s,;]+", text or ""):
+        token = raw_token.strip(" \t\r\n<>()[]{}\"'")
+        if not token:
+            continue
+        match = NOVEL_PATH_RE.search(token)
+        novel_id = match.group(1) if match else token if token.isdigit() else ""
+        if novel_id and novel_id not in seen:
+            seen.add(novel_id)
+            entries.append(novel_id)
+    return entries
+
+
+def write_temporary_batch_entries(entries: list[str]) -> Path:
+    """Write validated pasted IDs to a short-lived backend-compatible file."""
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        suffix=".txt",
+        prefix=TEMP_BATCH_PREFIX,
+        delete=False,
+    ) as handle:
+        handle.write("\n".join(entries) + "\n")
+        return Path(handle.name)
+
+
+def cleanup_temporary_batch_file(path: Path) -> None:
+    """Remove only paste-batch files created in the system temp directory."""
+    target = Path(path).resolve()
+    temp_root = Path(tempfile.gettempdir()).resolve()
+    if target.parent != temp_root or not target.name.startswith(TEMP_BATCH_PREFIX):
+        return
+    try:
+        target.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def lock_spinbox_mouse_wheel(spinbox) -> None:
@@ -42,8 +86,8 @@ def launch_ui() -> None:
 
     root = tk.Tk()
     root.title("PIA Scrap")
-    root.geometry("900x700")
-    root.minsize(840, 620)
+    root.geometry("960x760")
+    root.minsize(880, 680)
 
     cfg = load_config()
     env_cfg = dotenv_values(ENV_PATH) if ENV_PATH.exists() else {}
@@ -106,6 +150,7 @@ def launch_ui() -> None:
         save_env_btn.config(state=state)
         download_btn.config(state=state)
         batch_download_btn.config(state=state)
+        paste_batch_btn.config(state=state)
         scrape_btn.config(state=state)
         profile_combo.config(state=readonly_state)
         cancel_btn.config(state=("normal" if is_busy else "disabled"))

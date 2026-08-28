@@ -219,6 +219,8 @@ What it adds:
 - content-hash deduplication and reuse across rebuilds
 - offline EPUB embedding and local image markers in TXT chapters
 - optional listing-thumbnail downloads from both the CLI and desktop UI
+- signed-cookie support for Novelpia's protected chapter-image CDN
+- safe placeholders instead of broken external image links on permanent failures
 
 ## 15. Chapter Range And Random Intervals
 

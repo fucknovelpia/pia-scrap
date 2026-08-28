@@ -311,9 +311,13 @@ Image downloads are enabled by default for EPUB and TXT builds. The downloader:
 - validates the actual payload instead of trusting its URL extension
 - supports JPEG, PNG, GIF, WebP, SVG, and AVIF
 - uses the authenticated Novelpia session and viewer referrer when fetching assets
+- applies Novelpia's per-episode CloudFront signing cookies to protected chapter images
 - retries temporary failures, enforces a 25 MiB per-image limit, and reports failures
 - deduplicates identical content and reuses it on later builds
 - records sources, roles, chapters, sizes, hashes, and failures in `images.json`
+
+If a remote image is genuinely unavailable, EPUB output now inserts an
+`[Image unavailable]` placeholder instead of retaining a broken external URL.
 
 EPUB builds embed the downloaded assets for offline reading. TXT files cannot
 embed binary data, so they contain an `[Image: ... (images/...)]` marker at the

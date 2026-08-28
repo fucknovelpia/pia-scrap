@@ -266,11 +266,18 @@ def build_txt(
         epi_title = res["epi_title"]
 
         if image_manager:
+            image_cookies = res.get("_image_cookies") or {}
+            if not image_cookies and "pv-gn.novelpia.com" in html_text:
+                try:
+                    image_cookies = client.episode_image_cookies(episode_no)
+                except Exception as exc:
+                    print(f"[warn] Could not refresh image access for TXT chapter {i}: {exc}")
             html_text, chapter_assets = image_manager.localize_html(
                 html_text,
                 episode_no=episode_no,
                 context=f"episode:{episode_no}",
                 referer=f"{BASE_URL}/viewer/{episode_no}",
+                request_cookies=image_cookies,
             )
             print(f"[info] Saved {len(chapter_assets)} image(s) for TXT chapter {i}.")
 

@@ -147,6 +147,7 @@ class EpubBuilder:
         def localize_and_embed_images(
             html_str: str,
             episode_no: int,
+            image_cookies: Optional[Dict[str, str]] = None,
         ) -> Tuple[str, List[epub.EpubItem]]:
             if not image_manager:
                 return html_str, []
@@ -155,6 +156,7 @@ class EpubBuilder:
                 episode_no=episode_no,
                 context=f"episode:{episode_no}",
                 referer=f"{BASE_URL}/viewer/{episode_no}",
+                request_cookies=image_cookies,
             )
             added_items: List[epub.EpubItem] = []
             for asset in assets:
@@ -249,8 +251,19 @@ class EpubBuilder:
 
             html_text = res["html"]
             epi_title = res["epi_title"]
-            
-            html_text, new_imgs = localize_and_embed_images(html_text, episode_no)
+
+            image_cookies = res.get("_image_cookies") or {}
+            if image_manager and not image_cookies and "pv-gn.novelpia.com" in html_text:
+                try:
+                    image_cookies = client.episode_image_cookies(episode_no)
+                except Exception as exc:
+                    print(f"[warn] Could not refresh image access for chapter {i}: {exc}")
+
+            html_text, new_imgs = localize_and_embed_images(
+                html_text,
+                episode_no,
+                image_cookies=image_cookies,
+            )
             print(f"[info] Processed chapter {i}/{len(episodes)}: {epi_title} | embedded images: {len(new_imgs)}")
 
             chapter = epub.EpubHtml(

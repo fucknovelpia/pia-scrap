@@ -30,6 +30,12 @@ class Tokens:
 
 
 class NovelpiaClient:
+    IMAGE_COOKIE_NAMES = (
+        "CloudFront-Policy",
+        "CloudFront-Key-Pair-Id",
+        "CloudFront-Signature",
+    )
+
     def __init__(self, email: Optional[str] = None, password: Optional[str] = None,
                  proxy: Optional[str] = None, timeout: int = 30, throttle: Optional[float] = None,
                  userkey: Optional[str] = None, tkey: Optional[str] = None,
@@ -242,6 +248,23 @@ class NovelpiaClient:
             raise requests.HTTPError(describe_http_error(r), response=r)
         return r.json()
 
+    @classmethod
+    def signed_image_cookies(cls, ticket_data: Dict) -> Dict[str, str]:
+        """Extract temporary CDN cookies without persisting them to disk."""
+        result = ticket_data.get("result") or {}
+        signed_key = result.get("signed_key") or {}
+        if not isinstance(signed_key, dict):
+            return {}
+        return {
+            name: str(signed_key[name])
+            for name in cls.IMAGE_COOKIE_NAMES
+            if signed_key.get(name)
+        }
+
+    def episode_image_cookies(self, episode_no: int) -> Dict[str, str]:
+        """Fetch fresh signed cookies for protected images in a cached chapter."""
+        return self.signed_image_cookies(self.episode_ticket(episode_no))
+
     def fetch_episode(self, ep: Dict, idx: int = 0) -> Dict:
         """Fetch ticket and content for a single episode."""
         episode_no = ep.get("episode_no")
@@ -310,12 +333,18 @@ class NovelpiaClient:
                 or ""
             )
 
-        return {
+        result = {
             "html": html_from_episode_text(html_text),
             "epi_title": epi_title,
             "epi_no": epi_no,
             "idx": idx,
         }
+        image_cookies = self.signed_image_cookies(tdata)
+        if image_cookies:
+            # Private, in-memory field. save_cached_episode deliberately does
+            # not persist these temporary signed values.
+            result["_image_cookies"] = image_cookies
+        return result
 
     def fetch_episodes_parallel(self, ep_list: List[Dict[str, Any]], max_workers: int = 1, progress_cb=None) -> List[Dict[str, Any]]:
         """Fetch multiple episodes using the active fetch profile."""

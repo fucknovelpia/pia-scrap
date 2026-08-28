@@ -12,6 +12,25 @@ from src.ui import lock_spinbox_mouse_wheel
 
 
 class RequestIntervalTests(unittest.TestCase):
+    def test_extracts_cloudfront_image_cookies_from_episode_ticket(self):
+        signed = {
+            "CloudFront-Policy": "policy",
+            "CloudFront-Key-Pair-Id": "key-id",
+            "CloudFront-Signature": "signature",
+            "ignored": "value",
+        }
+        cookies = NovelpiaClient.signed_image_cookies(
+            {"result": {"signed_key": signed}}
+        )
+        self.assertEqual(
+            cookies,
+            {
+                "CloudFront-Policy": "policy",
+                "CloudFront-Key-Pair-Id": "key-id",
+                "CloudFront-Signature": "signature",
+            },
+        )
+
     def test_uses_random_value_between_configured_bounds(self):
         client = NovelpiaClient(min_interval=0.5, max_interval=2.0)
         with (
