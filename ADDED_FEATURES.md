@@ -229,3 +229,18 @@ single fixed interval with minimum/maximum controls. Each sequential chapter
 request or concurrent batch pause now uses a fresh random value in the configured range,
 which defaults to 0.5-2.0 seconds. Download-tab spinboxes ignore mouse-wheel
 events to prevent accidental value changes while scrolling.
+
+## 16. Organized Download Tab And Paste Batch
+
+Reorganized the Download tab into consistently spaced Novel Output, Batch
+Source, Download Options, and Actions sections. A new Paste URLs / IDs dialog
+accepts newline-, space-, comma-, or semicolon-separated entries, validates and
+deduplicates them, shows a live valid-novel count, and runs them through the
+same batch pipeline without requiring users to create a text file.
+
+## 17. Live Log Run Animation
+
+Starting a download, batch download, or link scrape now opens the Live Log tab
+automatically, briefly pulses its tab title, and displays an animated activity
+bar for as long as the command is running. The animation resets when the run
+finishes or is cancelled.

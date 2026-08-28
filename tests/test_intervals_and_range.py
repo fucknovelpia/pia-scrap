@@ -8,7 +8,12 @@ from unittest.mock import patch
 from src.api import NovelpiaClient
 from src.helper import save_config
 from src.novel import fetch_novel_and_episodes
-from src.ui import lock_spinbox_mouse_wheel
+from src.ui import (
+    cleanup_temporary_batch_file,
+    lock_spinbox_mouse_wheel,
+    parse_pasted_novel_entries,
+    write_temporary_batch_entries,
+)
 
 
 class RequestIntervalTests(unittest.TestCase):
@@ -154,6 +159,28 @@ class SettingsPersistenceTests(unittest.TestCase):
             self.assertEqual(config["min_interval"], 0.5)
             self.assertEqual(config["max_interval"], 2.0)
             self.assertEqual(config["login_at"], "new-token")
+
+
+class PastedBatchTests(unittest.TestCase):
+    def test_parses_urls_ids_mixed_separators_and_removes_duplicates(self):
+        pasted = """
+        https://global.novelpia.com/novel/4770
+        123, 4770; https://global.novelpia.com/novel/456?ref=batch
+        invalid https://example.com/not-a-novel
+        """
+        self.assertEqual(
+            parse_pasted_novel_entries(pasted),
+            ["4770", "123", "456"],
+        )
+
+    def test_temporary_paste_file_is_backend_compatible_and_cleaned_up(self):
+        path = write_temporary_batch_entries(["4770", "123"])
+        try:
+            self.assertTrue(path.is_file())
+            self.assertEqual(path.read_text(encoding="utf-8"), "4770\n123\n")
+        finally:
+            cleanup_temporary_batch_file(path)
+        self.assertFalse(path.exists())
 
 
 if __name__ == "__main__":

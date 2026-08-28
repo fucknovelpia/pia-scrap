@@ -1,5 +1,7 @@
 # pia-scrap
 
+Current version: **1.1.0**
+
 Novelpia downloader with:
 - EPUB export
 - TXT export
@@ -14,6 +16,7 @@ Use responsibly. Only access content your account can legitimately read. Respect
 
 Compared to the original script, this version includes:
 - desktop UI with live logs
+- automatic Live Log focus and activity animation when a run starts
 - Chrome session import
 - public listing scraper for `/novels`
 - batch mode from `novel_links.txt`
@@ -254,9 +257,11 @@ The desktop UI includes:
 - live log tab
 - single download
 - batch download from a links file
+- batch download from URLs or IDs pasted into a dedicated dialog
 - inclusive start/end chapter spinboxes
 - minimum/maximum random interval spinboxes (defaults: 0.5s and 2.0s)
 - mouse-wheel-locked spinboxes to prevent accidental changes while scrolling
+- grouped Novel Output, Batch Source, Download Options, and Actions sections
 - cancel button
 - log files under `output/logs`
 

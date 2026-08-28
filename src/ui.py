@@ -18,6 +18,7 @@ from tkinter import ttk, messagebox
 from dotenv import dotenv_values
 
 
+from src import __version__
 from src.chrome_session import list_chrome_profiles, load_chrome_novelpia_session
 from src.const import APP_DIR
 from src.helper import load_config, save_config
@@ -85,7 +86,7 @@ def launch_ui() -> None:
         os.chdir(Path(sys.executable).parent)
 
     root = tk.Tk()
-    root.title("PIA Scrap")
+    root.title(f"PIA Scrap v{__version__}")
     root.geometry("960x760")
     root.minsize(880, 680)
 
@@ -134,12 +135,14 @@ def launch_ui() -> None:
     current_log_path: Path | None = None
     was_cancelled = False
     cancel_event = threading.Event()
+    log_attention_generation = 0
 
     def set_status(text: str) -> None:
         status_var.set(text)
         root.update_idletasks()
 
     def set_busy(is_busy: bool) -> None:
+        nonlocal log_attention_generation
         busy_var.set(is_busy)
         state = "disabled" if is_busy else "normal"
         readonly_state = "disabled" if is_busy else "readonly"
@@ -148,12 +151,22 @@ def launch_ui() -> None:
         login_import_btn.config(state=state)
         save_btn.config(state=state)
         save_env_btn.config(state=state)
+        download_settings_btn.config(state=state)
         download_btn.config(state=state)
         batch_download_btn.config(state=state)
         paste_batch_btn.config(state=state)
         scrape_btn.config(state=state)
         profile_combo.config(state=readonly_state)
         cancel_btn.config(state=("normal" if is_busy else "disabled"))
+        if is_busy:
+            log_activity_var.set("Running - live output appears below")
+            log_activity_bar.start(80)
+        else:
+            log_activity_bar.stop()
+            log_activity_bar.configure(value=0)
+            log_activity_var.set("Run output appears below.")
+            log_attention_generation += 1
+            notebook.tab(log_tab, text="Live Log")
 
     def append_log(text: str) -> None:
         log_text.config(state="normal")
@@ -165,6 +178,26 @@ def launch_ui() -> None:
         log_text.config(state="normal")
         log_text.delete("1.0", "end")
         log_text.config(state="disabled")
+
+    def animate_live_log_attention() -> None:
+        """Reveal the live log and briefly pulse its tab label at run start."""
+        nonlocal log_attention_generation
+        log_attention_generation += 1
+        generation = log_attention_generation
+        frames = ("Live Log .", "Live Log ..", "Live Log ...")
+
+        notebook.select(log_tab)
+
+        def tick(frame_index: int = 0) -> None:
+            if generation != log_attention_generation:
+                return
+            if frame_index >= 9:
+                notebook.tab(log_tab, text="Live Log")
+                return
+            notebook.tab(log_tab, text=frames[frame_index % len(frames)])
+            root.after(180, tick, frame_index + 1)
+
+        tick()
 
     def summarize_output(output: str, fallback: str) -> str:
         lines = [line.strip() for line in (output or "").splitlines() if line.strip()]
@@ -331,10 +364,15 @@ def launch_ui() -> None:
         set_status("Saved credentials to .env.")
         messagebox.showinfo("Saved", "Credentials saved to .env")
 
-    def run_command(args: list[str], success_message: str, running_message: str) -> None:
+    def run_command(
+        args: list[str],
+        success_message: str,
+        running_message: str,
+        cleanup_paths: tuple[Path, ...] = (),
+    ) -> bool:
         nonlocal current_process, current_log_path
         if busy_var.get():
-            return
+            return False
 
         def worker() -> None:
             nonlocal current_process, current_log_path
@@ -433,6 +471,8 @@ def launch_ui() -> None:
                 root.after(0, lambda message=error_message: finish_run(1, message, success_message))
             finally:
                 current_process = None
+                for cleanup_path in cleanup_paths:
+                    cleanup_temporary_batch_file(cleanup_path)
 
         set_busy(True)
         cancel_event.clear()
@@ -443,9 +483,11 @@ def launch_ui() -> None:
             pass
         set_status(running_message)
         clear_log()
+        animate_live_log_attention()
         cmd_display = f"python main.py {' '.join(args)}"
         append_log(f"$ {cmd_display}\n\n")
         threading.Thread(target=worker, daemon=True).start()
+        return True
 
     def finish_run(returncode: int, output: str, success_message: str) -> None:
         nonlocal was_cancelled
@@ -565,10 +607,14 @@ def launch_ui() -> None:
             f"Scraping novel links from page {page_start_var.get().strip() or '1'} to {page_end_var.get().strip() or '63'}...",
         )
 
-    def run_batch_download() -> None:
+    def run_batch_download(
+        links_file_override: str | None = None,
+        cleanup_paths: tuple[Path, ...] = (),
+        source_label: str | None = None,
+    ) -> bool:
         settings = read_download_controls()
         if settings is None:
-            return
+            return False
         save_config({
             "login_at": login_at_var.get().strip(),
             "userkey": userkey_var.get().strip(),
@@ -581,7 +627,7 @@ def launch_ui() -> None:
             "download_images": download_images_var.get(),
             "scrape_images": scrape_images_var.get(),
         })
-        links_file = batch_links_var.get().strip() or "output/novel_links.txt"
+        links_file = links_file_override or batch_links_var.get().strip() or "output/novel_links.txt"
         args = ["--novel-links-file", links_file, "--out", out_var.get().strip() or "output"]
         if email_var.get().strip():
             args += ["--user", email_var.get().strip()]
@@ -608,11 +654,116 @@ def launch_ui() -> None:
         ]
 
         mode = "TXT" if txt_var.get() else "EPUB"
-        run_command(
+        display_source = source_label or links_file
+        return run_command(
             args,
-            f"Finished batch download from {links_file}.",
-            f"Batch downloading novels from {links_file} as {mode}...",
+            f"Finished batch download from {display_source}.",
+            f"Batch downloading novels from {display_source} as {mode}...",
+            cleanup_paths=cleanup_paths,
         )
+
+    def open_paste_batch_dialog() -> None:
+        if busy_var.get():
+            return
+
+        dialog = tk.Toplevel(root)
+        dialog.title("Paste URLs or Novel IDs")
+        dialog.geometry("700x480")
+        dialog.minsize(560, 380)
+        dialog.transient(root)
+        dialog.grab_set()
+        dialog.columnconfigure(0, weight=1)
+        dialog.rowconfigure(1, weight=1)
+
+        header = ttk.Frame(dialog, padding=(18, 16, 18, 8))
+        header.grid(row=0, column=0, sticky="ew")
+        header.columnconfigure(0, weight=1)
+        ttk.Label(
+            header,
+            text="Paste Novelpia novel URLs or numeric IDs",
+            font=("TkDefaultFont", 11, "bold"),
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            header,
+            text="Use one per line, or separate entries with spaces, commas, or semicolons. Duplicates are removed.",
+            wraplength=640,
+            justify="left",
+        ).grid(row=1, column=0, sticky="w", pady=(6, 0))
+
+        text_frame = ttk.Frame(dialog, padding=(18, 8))
+        text_frame.grid(row=1, column=0, sticky="nsew")
+        text_frame.columnconfigure(0, weight=1)
+        text_frame.rowconfigure(0, weight=1)
+        paste_text = tk.Text(text_frame, wrap="word", undo=True, padx=10, pady=10)
+        paste_text.grid(row=0, column=0, sticky="nsew")
+        paste_scroll = ttk.Scrollbar(text_frame, orient="vertical", command=paste_text.yview)
+        paste_scroll.grid(row=0, column=1, sticky="ns")
+        paste_text.configure(yscrollcommand=paste_scroll.set)
+
+        footer = ttk.Frame(dialog, padding=(18, 8, 18, 16))
+        footer.grid(row=2, column=0, sticky="ew")
+        footer.columnconfigure(1, weight=1)
+        count_var = tk.StringVar(value="0 valid novels")
+        ttk.Label(footer, textvariable=count_var).grid(row=0, column=0, sticky="w")
+
+        def refresh_count(_event=None) -> None:
+            count = len(parse_pasted_novel_entries(paste_text.get("1.0", "end-1c")))
+            count_var.set(f"{count} valid novel{'s' if count != 1 else ''}")
+
+        def paste_from_clipboard() -> None:
+            try:
+                clipboard_text = dialog.clipboard_get()
+            except tk.TclError:
+                messagebox.showwarning("Clipboard", "The clipboard does not contain text.", parent=dialog)
+                return
+            paste_text.insert("insert", clipboard_text)
+            refresh_count()
+
+        def start_pasted_batch(_event=None) -> str:
+            entries = parse_pasted_novel_entries(paste_text.get("1.0", "end-1c"))
+            if not entries:
+                messagebox.showerror(
+                    "Paste to Batch",
+                    "No valid novel URLs or numeric IDs were found.",
+                    parent=dialog,
+                )
+                return "break"
+
+            if read_download_controls() is None:
+                return "break"
+            try:
+                temporary_file = write_temporary_batch_entries(entries)
+            except OSError as exc:
+                messagebox.showerror(
+                    "Paste to Batch",
+                    f"Could not prepare the pasted batch:\n\n{exc}",
+                    parent=dialog,
+                )
+                return "break"
+            dialog.grab_release()
+            dialog.destroy()
+            started = run_batch_download(
+                links_file_override=str(temporary_file),
+                cleanup_paths=(temporary_file,),
+                source_label=f"{len(entries)} pasted novel{'s' if len(entries) != 1 else ''}",
+            )
+            if not started:
+                cleanup_temporary_batch_file(temporary_file)
+            return "break"
+
+        paste_text.bind("<KeyRelease>", refresh_count)
+        paste_text.bind("<Control-Return>", start_pasted_batch)
+        ttk.Button(footer, text="Paste Clipboard", command=paste_from_clipboard).grid(
+            row=0, column=2, padx=(8, 0)
+        )
+        ttk.Button(footer, text="Cancel", command=dialog.destroy).grid(
+            row=0, column=3, padx=(8, 0)
+        )
+        ttk.Button(footer, text="Run Batch", command=start_pasted_batch).grid(
+            row=0, column=4, padx=(8, 0)
+        )
+
+        paste_text.focus_set()
 
     root.columnconfigure(0, weight=1)
     root.rowconfigure(1, weight=1)
@@ -630,9 +781,8 @@ def launch_ui() -> None:
     creds_tab.columnconfigure(2, weight=1)
     notebook.add(creds_tab, text="Login")
 
-    download_tab = ttk.Frame(notebook, padding=16)
-    download_tab.columnconfigure(1, weight=1)
-    download_tab.columnconfigure(2, weight=1)
+    download_tab = ttk.Frame(notebook, padding=(18, 16))
+    download_tab.columnconfigure(0, weight=1)
     notebook.add(download_tab, text="Download")
 
     scrape_tab = ttk.Frame(notebook, padding=16)
@@ -758,21 +908,72 @@ def launch_ui() -> None:
         justify="left",
     ).grid(row=13, column=0, columnspan=3, sticky="w", pady=(12, 0))
 
-    ttk.Label(download_tab, text="Novel ID").grid(row=0, column=0, sticky="w", pady=4)
-    ttk.Entry(download_tab, textvariable=novel_id_var).grid(row=0, column=1, sticky="ew", pady=4)
-    ttk.Checkbutton(download_tab, text="Export TXT instead of EPUB", variable=txt_var).grid(
-        row=0, column=2, sticky="w", padx=(12, 0), pady=4
+    # --- Novel output -----------------------------------------------------
+    novel_section = ttk.LabelFrame(download_tab, text="Novel output", padding=(14, 12))
+    novel_section.grid(row=0, column=0, sticky="ew", pady=(0, 12))
+    novel_section.columnconfigure(1, weight=1)
+
+    ttk.Label(novel_section, text="Novel ID or URL", width=18).grid(
+        row=0, column=0, sticky="w", padx=(0, 12), pady=6
+    )
+    ttk.Entry(novel_section, textvariable=novel_id_var).grid(
+        row=0, column=1, columnspan=2, sticky="ew", pady=6
     )
 
-    ttk.Label(download_tab, text="Output dir").grid(row=1, column=0, sticky="w", pady=4)
-    ttk.Entry(download_tab, textvariable=out_var).grid(row=1, column=1, columnspan=2, sticky="ew", pady=4)
+    ttk.Label(novel_section, text="Output directory", width=18).grid(
+        row=1, column=0, sticky="w", padx=(0, 12), pady=6
+    )
+    ttk.Entry(novel_section, textvariable=out_var).grid(
+        row=1, column=1, columnspan=2, sticky="ew", pady=6
+    )
 
-    ttk.Label(download_tab, text="Batch links file").grid(row=2, column=0, sticky="w", pady=4)
-    ttk.Entry(download_tab, textvariable=batch_links_var).grid(row=2, column=1, columnspan=2, sticky="ew", pady=4)
+    output_toggles = ttk.Frame(novel_section)
+    output_toggles.grid(row=2, column=1, columnspan=2, sticky="w", pady=(6, 2))
+    ttk.Checkbutton(
+        output_toggles,
+        text="Export TXT instead of EPUB",
+        variable=txt_var,
+    ).grid(row=0, column=0, sticky="w", padx=(0, 22))
+    ttk.Checkbutton(
+        output_toggles,
+        text="Download cover and chapter images",
+        variable=download_images_var,
+    ).grid(row=0, column=1, sticky="w")
 
-    ttk.Label(download_tab, text="Chapter range").grid(row=3, column=0, sticky="w", pady=4)
-    chapter_range_frame = ttk.Frame(download_tab)
-    chapter_range_frame.grid(row=3, column=1, sticky="w", pady=4)
+    # --- Batch source -----------------------------------------------------
+    batch_section = ttk.LabelFrame(download_tab, text="Batch source", padding=(14, 12))
+    batch_section.grid(row=1, column=0, sticky="ew", pady=(0, 12))
+    batch_section.columnconfigure(1, weight=1)
+
+    ttk.Label(batch_section, text="Links file", width=18).grid(
+        row=0, column=0, sticky="w", padx=(0, 12), pady=6
+    )
+    ttk.Entry(batch_section, textvariable=batch_links_var).grid(
+        row=0, column=1, sticky="ew", pady=6
+    )
+    paste_batch_btn = ttk.Button(
+        batch_section,
+        text="Paste to Batch...",
+        command=open_paste_batch_dialog,
+    )
+    paste_batch_btn.grid(row=0, column=2, sticky="e", padx=(12, 0), pady=6)
+    ttk.Label(
+        batch_section,
+        text="Choose a saved .txt list, or paste URLs and numeric IDs directly.",
+        justify="left",
+    ).grid(row=1, column=1, columnspan=2, sticky="w", pady=(2, 4))
+
+    # --- Download options ------------------------------------------------
+    options_section = ttk.LabelFrame(download_tab, text="Download options", padding=(14, 12))
+    options_section.grid(row=2, column=0, sticky="ew", pady=(0, 12))
+    options_section.columnconfigure(1, weight=1)
+    options_section.columnconfigure(2, weight=1)
+
+    ttk.Label(options_section, text="Chapter range", width=18).grid(
+        row=0, column=0, sticky="w", padx=(0, 12), pady=6
+    )
+    chapter_range_frame = ttk.Frame(options_section)
+    chapter_range_frame.grid(row=0, column=1, sticky="w", pady=6)
     ttk.Label(chapter_range_frame, text="Start").grid(row=0, column=0, padx=(0, 4))
     start_chapter_spinbox = ttk.Spinbox(
         chapter_range_frame,
@@ -794,29 +995,33 @@ def launch_ui() -> None:
     )
     end_chapter_spinbox.grid(row=0, column=3)
     ttk.Label(
-        download_tab,
+        options_section,
         text="0 = first/last available chapter",
         justify="left",
-    ).grid(row=3, column=2, sticky="w", padx=(12, 0), pady=4)
+    ).grid(row=0, column=2, sticky="w", padx=(18, 0), pady=6)
 
-    ttk.Label(download_tab, text="Threads").grid(row=4, column=0, sticky="w", pady=4)
+    ttk.Label(options_section, text="Threads", width=18).grid(
+        row=1, column=0, sticky="w", padx=(0, 12), pady=6
+    )
     threads_spinbox = ttk.Spinbox(
-        download_tab,
+        options_section,
         from_=1,
         to=10,
         textvariable=threads_var,
         width=5,
     )
-    threads_spinbox.grid(row=4, column=1, sticky="w", pady=4)
+    threads_spinbox.grid(row=1, column=1, sticky="w", pady=6)
     ttk.Label(
-        download_tab,
+        options_section,
         text="Concurrent download workers (1 = sequential)",
         justify="left",
-    ).grid(row=4, column=2, sticky="w", padx=(12, 0), pady=4)
+    ).grid(row=1, column=2, sticky="w", padx=(18, 0), pady=6)
 
-    ttk.Label(download_tab, text="Interval range (s)").grid(row=5, column=0, sticky="w", pady=4)
-    interval_range_frame = ttk.Frame(download_tab)
-    interval_range_frame.grid(row=5, column=1, sticky="w", pady=4)
+    ttk.Label(options_section, text="Interval range (s)", width=18).grid(
+        row=2, column=0, sticky="w", padx=(0, 12), pady=6
+    )
+    interval_range_frame = ttk.Frame(options_section)
+    interval_range_frame.grid(row=2, column=1, sticky="w", pady=6)
     ttk.Label(interval_range_frame, text="Min").grid(row=0, column=0, padx=(0, 4))
     min_interval_spinbox = ttk.Spinbox(
         interval_range_frame,
@@ -840,10 +1045,10 @@ def launch_ui() -> None:
     )
     max_interval_spinbox.grid(row=0, column=3)
     ttk.Label(
-        download_tab,
+        options_section,
         text="A fresh random delay is used per chapter or concurrent batch",
         justify="left",
-    ).grid(row=5, column=2, sticky="w", padx=(12, 0), pady=4)
+    ).grid(row=2, column=2, sticky="w", padx=(18, 0), pady=6)
 
     for spinbox in (
         start_chapter_spinbox,
@@ -854,24 +1059,24 @@ def launch_ui() -> None:
     ):
         lock_spinbox_mouse_wheel(spinbox)
 
-    ttk.Checkbutton(
-        download_tab,
-        text="Download cover and chapter images",
-        variable=download_images_var,
-    ).grid(row=6, column=0, columnspan=3, sticky="w", pady=(8, 0))
+    # --- Actions ----------------------------------------------------------
+    actions = ttk.Frame(download_tab)
+    actions.grid(row=3, column=0, sticky="ew", pady=(2, 0))
+    actions.columnconfigure(1, weight=1)
 
-    ttk.Button(
-        download_tab,
+    download_settings_btn = ttk.Button(
+        actions,
         text="Save Settings",
         command=save_session_to_config,
-    ).grid(row=7, column=0, sticky="w", pady=(12, 0))
+    )
+    download_settings_btn.grid(row=0, column=0, sticky="w")
 
-    cancel_btn = ttk.Button(download_tab, text="Cancel", command=cancel_run, state="disabled")
-    cancel_btn.grid(row=7, column=1, sticky="e", pady=(12, 0))
-    batch_download_btn = ttk.Button(download_tab, text="Run Batch Download", command=run_batch_download)
-    batch_download_btn.grid(row=7, column=2, sticky="w", pady=(12, 0))
-    download_btn = ttk.Button(download_tab, text="Run Download", command=run_download)
-    download_btn.grid(row=7, column=2, sticky="e", pady=(12, 0))
+    cancel_btn = ttk.Button(actions, text="Cancel", command=cancel_run, state="disabled", width=12)
+    cancel_btn.grid(row=0, column=2, sticky="e", padx=(8, 0))
+    batch_download_btn = ttk.Button(actions, text="Run File Batch", command=run_batch_download, width=16)
+    batch_download_btn.grid(row=0, column=3, sticky="e", padx=(8, 0))
+    download_btn = ttk.Button(actions, text="Download Novel", command=run_download, width=16)
+    download_btn.grid(row=0, column=4, sticky="e", padx=(8, 0))
 
     ttk.Label(scrape_tab, text="Page start").grid(row=0, column=0, sticky="w", pady=4)
     ttk.Entry(scrape_tab, textvariable=page_start_var).grid(row=0, column=1, sticky="ew", pady=4)
@@ -891,7 +1096,20 @@ def launch_ui() -> None:
     scrape_btn = ttk.Button(scrape_tab, text="Run Link Scrape", command=run_link_scrape)
     scrape_btn.grid(row=4, column=2, sticky="e", pady=(12, 0))
 
-    ttk.Label(log_tab, text="Live Log").grid(row=0, column=0, sticky="w", pady=(0, 6))
+    log_header = ttk.Frame(log_tab)
+    log_header.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+    log_header.columnconfigure(1, weight=1)
+    ttk.Label(log_header, text="Live Log").grid(row=0, column=0, sticky="w")
+    log_activity_var = tk.StringVar(value="Run output appears below.")
+    ttk.Label(log_header, textvariable=log_activity_var).grid(
+        row=0, column=1, sticky="e", padx=(16, 10)
+    )
+    log_activity_bar = ttk.Progressbar(
+        log_header,
+        mode="indeterminate",
+        length=150,
+    )
+    log_activity_bar.grid(row=0, column=2, sticky="e")
     log_text = tk.Text(log_tab, height=18, wrap="word", state="disabled")
     log_text.grid(row=1, column=0, sticky="nsew")
     log_scroll = ttk.Scrollbar(log_tab, orient="vertical", command=log_text.yview)

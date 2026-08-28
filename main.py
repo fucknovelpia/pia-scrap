@@ -12,7 +12,7 @@ from src.chrome_session import load_chrome_novelpia_session
 from src.helper import load_config, save_config
 from src.scraper import scrape_novel_links
 from src.ui import launch_ui
-from src import const
+from src import __version__, const
 
 # ----------------------------
 # Main Function
@@ -118,6 +118,7 @@ def parse_novel_id(value: str) -> int:
 def main():
     load_dotenv()
     ap = argparse.ArgumentParser(description="Novelpia to EPUB packer (API)")
+    ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     ap.add_argument("novel_id", type=parse_novel_id, nargs="?", help="Novel ID or URL (e.g., 1072 or https://global.novelpia.com/novel/1072)")
     ap.add_argument("--ui", action="store_true", help="Launch the desktop UI")
     ap.add_argument("--user", "--email", "-u", "-e", dest="email", help="Novelpia email (overrides config tokens if provided)")
