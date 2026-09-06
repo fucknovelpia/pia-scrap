@@ -424,7 +424,14 @@ def install_viewer_handoff(
         diagnostic("Response observer and document-start guard ready.")
 
         def navigate():
-            window.show()
+            from System.Windows.Forms import FormWindowState
+
+            # Let the hidden neutral page lay out at normal size first. Creating
+            # an already-minimized WebView gives it a tiny, clipped viewport.
+            # Minimize before revealing, and avoid pywebview's show(), which
+            # also calls Activate(). The taskbar can restore it normally.
+            native.WindowState = FormWindowState.Minimized
+            native.Show()
             window.load_url(f"{const.BASE_URL}/viewer/{episode_no}")
 
         on_ui(navigate)

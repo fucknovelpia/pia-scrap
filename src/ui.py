@@ -1131,7 +1131,7 @@ def launch_ui() -> None:
     max_interval_spinbox.grid(row=0, column=3)
     ttk.Label(
         options_section,
-        text="A fresh random delay is used per chapter or concurrent batch",
+        text="Fresh random delay before each worker's chapter request",
         justify="left",
     ).grid(row=2, column=2, sticky="w", padx=(18, 0), pady=6)
 

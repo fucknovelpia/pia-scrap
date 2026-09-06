@@ -225,10 +225,14 @@ What it adds:
 ## 15. Chapter Range And Random Intervals
 
 Added inclusive start/end chapter controls to the Download tab and replaced the
-single fixed interval with minimum/maximum controls. Each sequential chapter
-request or concurrent batch pause now uses a fresh random value in the configured range,
-which defaults to 0.5-2.0 seconds. Download-tab spinboxes ignore mouse-wheel
+single fixed interval with minimum/maximum controls. Each worker waits a fresh
+random delay before every chapter request, including its first request. The
+configured range defaults to 0.5-2.0 seconds. Download-tab spinboxes ignore mouse-wheel
 events to prevent accidental value changes while scrolling.
+
+Threads sets the maximum number of simultaneous chapter downloads and their
+advertisements. Each worker starts the next queued chapter as soon as it becomes
+free. Recovery attempts stay in the same worker slot while other workers continue.
 
 ## 16. Organized Download Tab And Paste Batch
 

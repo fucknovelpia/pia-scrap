@@ -87,7 +87,10 @@ class NovelpiaClient:
             raise ValueError("Minimum request interval cannot exceed maximum request interval.")
         self.interval_min = interval_min
         self.interval_max = interval_max
-        self._suppress_request_interval = False
+        self._interval_lock = threading.Lock()
+        self._request_context = threading.local()
+        self._auth_lock = threading.RLock()
+        self._auth_generation = 0
         self.chapter_counter = 0
         self.default_max_workers = max(1, int(threads or 1))
         self.recover_attempts = 2
@@ -117,27 +120,38 @@ class NovelpiaClient:
     @throttle.setter
     def throttle(self, value: float) -> None:
         fixed = max(0.0, float(value))
-        self.interval_min = fixed
-        self.interval_max = fixed
+        with self._interval_lock:
+            self.interval_min = fixed
+            self.interval_max = fixed
 
     def _next_request_interval(self) -> float:
-        if self.interval_min == self.interval_max:
-            return self.interval_min
-        return random.uniform(self.interval_min, self.interval_max)
+        with self._interval_lock:
+            lower, upper = self.interval_min, self.interval_max
+        recovery_bounds = getattr(self._request_context, "recovery_bounds", None)
+        if recovery_bounds is not None:
+            lower = max(lower, recovery_bounds[0])
+            upper = max(upper, recovery_bounds[1], lower)
+        if lower == upper:
+            return lower
+        return random.uniform(lower, upper)
 
-    def _sleep_request_interval(self, force: bool = False) -> float:
-        if self._suppress_request_interval and not force:
-            return 0.0
+    def _sleep_request_interval(self) -> float:
         delay = self._next_request_interval()
         if delay > 0:
             if const.HTTP_LOG:
                 print(f"[api] Waiting {delay:.2f}s before the next episode request.")
-            time.sleep(delay)
+            cancel_event.wait(delay)
         return delay
 
 
 
     def login(self):
+        with self._auth_lock:
+            token = self._login()
+            self._auth_generation += 1
+            return token
+
+    def _login(self):
         if not self.email or not self.password:
             raise AuthenticationError("No email/password credentials are available. Sign in again in the Login tab.")
         self.s.cookies.set("last_login", "basic", domain=".novelpia.com", path="/")
@@ -160,6 +174,15 @@ class NovelpiaClient:
         return self.tokens.login_at
 
     def refresh(self) -> Optional[str]:
+        generation = self._auth_generation
+        with self._auth_lock:
+            if generation != self._auth_generation and self.tokens.login_at:
+                return self.tokens.login_at
+            token = self._refresh()
+            self._auth_generation += 1
+            return token
+
+    def _refresh(self) -> Optional[str]:
         url = f"{const.API_BASE}/v1/login/refresh"
         # /v1/login/refresh works with session cookies (including TKEY).
         # Do NOT send login-at header — if the JWT is expired, the API
@@ -184,10 +207,11 @@ class NovelpiaClient:
 
     def _on_rate_limit(self):
         """Increase both interval bounds when a 429 response occurs."""
-        old_min = self.interval_min
-        old_max = self.interval_max
-        self.interval_min = min(15.0, self.interval_min + 1.5)
-        self.interval_max = min(15.0, max(self.interval_min, self.interval_max + 1.5))
+        with self._interval_lock:
+            old_min = self.interval_min
+            old_max = self.interval_max
+            self.interval_min = min(15.0, self.interval_min + 1.5)
+            self.interval_max = min(15.0, max(self.interval_min, self.interval_max + 1.5))
         if const.HTTP_LOG:
             print(
                 "[api] Increased request interval from "
@@ -256,11 +280,15 @@ class NovelpiaClient:
 
     def episode_ticket(self, episode_no: int) -> Dict:
         # Randomized pause before the ticket endpoint to avoid rate limits.
+        if cancel_event.is_set():
+            raise requests.RequestException("Cancelled by user")
         self._sleep_request_interval()
+        if cancel_event.is_set():
+            raise requests.RequestException("Cancelled by user")
         r = self._episode_ticket_response(episode_no)
         if _is_ad_required(r):
             print(
-                f"[ad] Episode {episode_no} requires an advertisement. Opening the ad window; "
+                f"[ad] Episode {episode_no} requires an advertisement. Opening a minimized ad window; "
                 "Continue will be auto-clicked when the ad finishes.", flush=True,
             )
             r = watch_episode_ad(
@@ -422,121 +450,122 @@ class NovelpiaClient:
         return results
 
     def _fetch_episodes_concurrent(self, ep_list: List[Dict[str, Any]], max_workers: int, progress_cb=None) -> List[Dict[str, Any]]:
-        """Fetch episodes in batches of max_workers, like NpiaDownloader67.
-
-        Each batch submits max_workers chapters simultaneously with no
-        per-worker pause inside the batch. A random interval is applied
-        between batches instead, preventing rate limits while maximising
-        throughput.
-        """
+        """Refill each worker independently, including its delays and recovery."""
         print(
             f"[info] Fetching with {max_workers} concurrent workers, "
-            f"{self.interval_min:.1f}-{self.interval_max:.1f}s random delay between batches."
+            f"{self.interval_min:.1f}-{self.interval_max:.1f}s random delay per chapter request. "
+            "Each free worker starts the next queued chapter.", flush=True,
         )
         total = len(ep_list)
         results: List[Dict[str, Any]] = [{} for _ in range(total)]
-        num_batches = (total + max_workers - 1) // max_workers
+        if not total:
+            return results
 
-        # Suppress per-worker pauses inside a concurrent batch. A fresh random
-        # pause from the configured range is applied between batches instead.
-        saved_suppression = self._suppress_request_interval
+        def check_cancelled():
+            if cancel_event.is_set():
+                raise KeyboardInterrupt("Cancelled by user")
 
-        try:
-            self._suppress_request_interval = True
-            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-                for batch_start in range(0, total, max_workers):
-                    batch = ep_list[batch_start:batch_start + max_workers]
-                    batch_indices = list(range(batch_start, batch_start + len(batch)))
-                    batch_num = batch_start // max_workers + 1
-                    ch_ids = [i + 1 for i in batch_indices]
-                    batch_t0 = time.time()
-                    print(f"[batch {batch_num}/{num_batches}] Downloading Ch.{ch_ids[0]}-{ch_ids[-1]} ({len(batch)} chapters)...")
+        def fetch_with_recovery(ep, idx):
+            check_cancelled()
+            try:
+                res = self.fetch_episode(ep, idx)
+            except Exception as exc:
+                res = {"error": str(exc), "idx": idx}
+            check_cancelled()
+            if not res or "error" in res:
+                err = res.get("error") if res else "Unknown error"
+                print(f"[warn] Chapter {idx} failed: {err}", flush=True)
+                if not res or res.get("retryable", True):
+                    # Recovery keeps this slot; it cannot block the scheduler
+                    # or create an extra download outside the worker limit.
+                    res = self._recover_episode(ep, idx)
+            return res
 
-                    # Submit the batch with per-worker pauses suppressed.
-                    future_map = {}
-                    for i, ep in zip(batch_indices, batch):
-                        idx = i + 1  # 1-based
-                        future_map[executor.submit(self.fetch_episode, ep, idx)] = (idx, ep)
+        next_index = 0
+        pending = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            def fill_available_slots():
+                nonlocal next_index
+                while next_index < total and len(pending) < max_workers:
+                    check_cancelled()
+                    idx = next_index + 1
+                    ep = ep_list[next_index]
+                    pending[executor.submit(fetch_with_recovery, ep, idx)] = (idx, ep)
+                    next_index += 1
 
-                    # Wait for batch to complete
-                    for future in concurrent.futures.as_completed(future_map):
-                        if cancel_event.is_set():
-                            # Cancel remaining futures
-                            for f in future_map:
-                                f.cancel()
-                            raise KeyboardInterrupt("Cancelled by user")
-                        idx, ep = future_map[future]
+            try:
+                fill_available_slots()
+                while pending:
+                    check_cancelled()
+                    done, _ = concurrent.futures.wait(
+                        pending, timeout=0.2,
+                        return_when=concurrent.futures.FIRST_COMPLETED,
+                    )
+                    for future in done:
+                        check_cancelled()
+                        idx, ep = pending.pop(future)
                         try:
                             res = future.result()
-                        except Exception as e:
-                            res = {"error": str(e), "idx": idx}
-
-                        if (not res) or ("error" in res):
-                            if cancel_event.is_set():
-                                raise KeyboardInterrupt("Cancelled by user")
-                            err = res.get("error") if res else "Unknown error"
-                            print(f"[warn] Chapter {idx} failed: {err}")
-                            if not res or res.get("retryable", True):
-                                self._suppress_request_interval = False
-                                res = self._recover_episode(ep, idx)
-                                self._suppress_request_interval = True
-
+                        except Exception as exc:
+                            res = {"error": str(exc), "idx": idx,
+                                   "epi_no": ep.get("episode_no"), "epi_title": ep.get("epi_title")}
                         results[idx - 1] = res
+                        # Keep progress/cache consumers on this coordinator
+                        # thread, with the original index even out of order.
                         if progress_cb:
-                            ok = bool(res) and "error" not in res
-                            progress_cb(idx, ok, res)
-
-                    batch_elapsed = time.time() - batch_t0
-                    print(f"[batch {batch_num}/{num_batches}] Done in {batch_elapsed:.1f}s")
-
-                    # Check for cancellation
-                    if cancel_event.is_set():
-                        print("[info] Download cancelled by user.")
-                        raise KeyboardInterrupt("Cancelled by user")
-
-                    if batch_start + max_workers < total:
-                        self._sleep_request_interval(force=True)
-        finally:
-            self._suppress_request_interval = saved_suppression
+                            progress_cb(idx, bool(res) and "error" not in res, res)
+                        fill_available_slots()
+            finally:
+                for future in pending:
+                    future.cancel()
         return results
 
     def _recover_episode(self, ep: Dict[str, Any], idx: int) -> Dict[str, Any]:
         if cancel_event.is_set():
             return {"error": "cancelled", "idx": idx}
-        old_interval_min = self.interval_min
-        old_interval_max = self.interval_max
+        previous_bounds = getattr(self._request_context, "recovery_bounds", None)
+        with self._interval_lock:
+            recovery_min = min(10.0, max(self.interval_min + 1.0, self.recover_throttle))
+            recovery_max = min(10.0, max(self.interval_max + 1.0, recovery_min))
+        # Recovery changes only this worker's delay. Global 429 backoff remains
+        # in force and cannot be rolled back by another worker finishing a retry.
+        self._request_context.recovery_bounds = (recovery_min, recovery_max)
         retry_res: Optional[Dict[str, Any]] = None
-        self.interval_min = min(10.0, max(self.interval_min + 1.0, self.recover_throttle))
-        self.interval_max = min(10.0, max(self.interval_max + 1.0, self.interval_min))
         try:
             for attempt in range(1, self.recover_attempts + 1):
                 if cancel_event.is_set():
                     return {"error": "cancelled", "idx": idx}
+                auth_generation = self._auth_generation
                 cooldown = random.uniform(self.recover_cooldown_min, self.recover_cooldown_max)
                 print(
                     f"[warn] Cooling down {cooldown:.1f}s before recovery attempt {attempt}/{self.recover_attempts} "
                     f"for chapter {idx}..."
                 )
-                # Sleep in small increments so cancel is responsive
-                for _ in range(int(cooldown * 10)):
-                    if cancel_event.is_set():
-                        return {"error": "cancelled", "idx": idx}
-                    time.sleep(0.1)
+                if cancel_event.wait(cooldown):
+                    return {"error": "cancelled", "idx": idx}
 
                 if self.rotate_session_on_failure:
-                    try:
-                        if self.tokens.login_at:
-                            print("[info] Trying session refresh before retry...")
-                            self.refresh()
-                    except Exception as e:
-                        print(f"[warn] Session refresh failed before retry: {e}")
+                    # Other workers keep downloading. Only auth changes share
+                    # a lock, including cookies and the saved session file.
+                    with self._auth_lock:
+                        if cancel_event.is_set():
+                            return {"error": "cancelled", "idx": idx}
+                        if auth_generation == self._auth_generation:
+                            refreshed = False
+                            try:
+                                if self.tokens.login_at:
+                                    print("[info] Trying session refresh before retry...")
+                                    self.refresh()
+                                    refreshed = True
+                            except Exception as e:
+                                print(f"[warn] Session refresh failed before retry: {e}")
 
-                    try:
-                        if self.email and self.password:
-                            print("[info] Trying full re-login before retry...")
-                            self.login()
-                    except Exception as e:
-                        print(f"[warn] Full re-login failed before retry: {e}")
+                            try:
+                                if not refreshed and self.email and self.password:
+                                    print("[info] Trying full re-login before retry...")
+                                    self.login()
+                            except Exception as e:
+                                print(f"[warn] Full re-login failed before retry: {e}")
 
                 retry_res = self.fetch_episode(ep, idx)
                 if retry_res and not retry_res.get("retryable", True):
@@ -550,8 +579,7 @@ class NovelpiaClient:
 
             return retry_res if retry_res else {"error": "recovery failed", "idx": idx}
         finally:
-            self.interval_min = old_interval_min
-            self.interval_max = old_interval_max
+            self._request_context.recovery_bounds = previous_bounds
 
 
 def describe_http_error(resp: requests.Response) -> str:

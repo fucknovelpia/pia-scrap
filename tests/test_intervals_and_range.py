@@ -1,11 +1,14 @@
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from src.api import NovelpiaClient
+import requests
+
+from src.api import NovelpiaClient, cancel_event
 from src.helper import save_config
 from src.novel import fetch_novel_and_episodes
 from src.ui import (
@@ -17,6 +20,10 @@ from src.ui import (
 
 
 class RequestIntervalTests(unittest.TestCase):
+    def setUp(self):
+        cancel_event.clear()
+        self.addCleanup(cancel_event.clear)
+
     def test_extracts_cloudfront_image_cookies_from_episode_ticket(self):
         signed = {
             "CloudFront-Policy": "policy",
@@ -40,7 +47,7 @@ class RequestIntervalTests(unittest.TestCase):
         client = NovelpiaClient(min_interval=0.5, max_interval=2.0)
         with (
             patch("src.api.random.uniform", return_value=1.25) as uniform,
-            patch("src.api.time.sleep") as sleep,
+            patch.object(cancel_event, "wait", return_value=False) as sleep,
         ):
             delay = client._sleep_request_interval()
 
@@ -62,11 +69,10 @@ class RequestIntervalTests(unittest.TestCase):
         self.assertEqual(client.interval_min, 2.0)
         self.assertEqual(client.interval_max, 3.5)
 
-    def test_concurrent_batches_use_one_random_pause_between_batches(self):
+    def test_concurrent_workers_each_use_the_configured_random_pause(self):
         client = NovelpiaClient(min_interval=0.5, max_interval=2.0, threads=2)
 
         def fetch_episode(episode, idx):
-            # This call is suppressed inside a concurrent batch.
             client._sleep_request_interval()
             return {"html": "ok", "epi_title": str(idx), "epi_no": episode["episode_no"]}
 
@@ -74,13 +80,78 @@ class RequestIntervalTests(unittest.TestCase):
         episodes = [{"episode_no": number} for number in range(1, 4)]
         with (
             patch("src.api.random.uniform", return_value=1.1) as uniform,
-            patch("src.api.time.sleep") as sleep,
+            patch.object(cancel_event, "wait", return_value=False) as sleep,
         ):
             results = client._fetch_episodes_concurrent(episodes, max_workers=2)
 
         self.assertEqual(len(results), 3)
-        uniform.assert_called_once_with(0.5, 2.0)
-        sleep.assert_called_once_with(1.1)
+        self.assertEqual(uniform.call_count, 3)
+        self.assertTrue(all(call.args == (0.5, 2.0) for call in uniform.call_args_list))
+        self.assertEqual(sleep.call_count, 3)
+        self.assertTrue(all(call.args == (1.1,) for call in sleep.call_args_list))
+
+    def test_cancel_during_request_delay_does_not_send_the_ticket(self):
+        client = NovelpiaClient(throttle=10)
+
+        def cancel_during_wait(delay):
+            cancel_event.set()
+            return True
+
+        with (
+            patch.object(cancel_event, "wait", side_effect=cancel_during_wait),
+            patch.object(client, "_episode_ticket_response") as request,
+        ):
+            with self.assertRaisesRegex(requests.RequestException, "Cancelled"):
+                client.episode_ticket(42)
+        request.assert_not_called()
+
+    def test_overlapping_recovery_keeps_delays_local_and_preserves_rate_limit_backoff(self):
+        client = NovelpiaClient(min_interval=0.5, max_interval=2)
+        client.recover_attempts = 1
+        client.recover_cooldown_min = client.recover_cooldown_max = 0
+        client.rotate_session_on_failure = False
+        ready = threading.Barrier(3)
+        release = threading.Event()
+        errors = []
+        recovery_delays = []
+
+        def fetch(episode, idx):
+            recovery_delays.append(client._next_request_interval())
+            ready.wait(3)
+            if not release.wait(3):
+                raise AssertionError("Recovery was not released")
+            self.assertEqual(client._next_request_interval(), 5)
+            return {"html": "ok", "idx": idx}
+
+        def recover(idx):
+            try:
+                result = client._recover_episode({"episode_no": idx}, idx)
+                self.assertEqual(result["html"], "ok")
+            except BaseException as exc:
+                errors.append(exc)
+
+        with (
+            patch.object(client, "fetch_episode", side_effect=fetch),
+            patch("src.api.random.uniform", side_effect=lambda lower, upper: upper),
+        ):
+            workers = [threading.Thread(target=recover, args=(idx,), daemon=True) for idx in (1, 2)]
+            for worker in workers:
+                worker.start()
+            try:
+                ready.wait(3)
+                # Unrelated workers retain their configured delay during retry.
+                self.assertEqual(client._next_request_interval(), 2)
+                client._on_rate_limit()
+                client._on_rate_limit()
+            finally:
+                release.set()
+                for worker in workers:
+                    worker.join(3)
+            self.assertTrue(all(not worker.is_alive() for worker in workers))
+            self.assertEqual(errors, [])
+            self.assertEqual(recovery_delays, [3, 3])
+            self.assertEqual(client._next_request_interval(), 5)
+            self.assertEqual((client.interval_min, client.interval_max), (3.5, 5))
 
     def test_rejects_invalid_interval_range(self):
         with self.assertRaises(ValueError):

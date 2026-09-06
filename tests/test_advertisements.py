@@ -428,6 +428,8 @@ class AdvertisementViewerTests(unittest.TestCase):
             self.assertTrue(calls[0].kwargs["hidden"])
             for call in calls[1:]:
                 self.assertTrue(call.kwargs["hidden"])
+                # Minimize after the hidden neutral page establishes its size.
+                self.assertFalse(call.kwargs.get("minimized", False))
                 self.assertEqual((call.kwargs["width"], call.kwargs["height"]), (480, 540))
                 self.assertEqual(call.kwargs["min_size"], (420, 480))
                 self.assertIn("Preparing advertisement", call.kwargs["html"])

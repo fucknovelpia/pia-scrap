@@ -128,14 +128,18 @@ Or do it from the UI with:
 
 When a chapter requires an advertisement (`0010`), the downloader opens that
 chapter in the official viewer using the app's browser profile. Let the real ad
-finish; the compact ad window clicks the normal Continue button as soon as it
-becomes ready, without waiting for other page resources to finish loading, then
+finish; the compact ad window starts minimized on the taskbar and clicks the
+normal Continue button as soon as it becomes ready, without waiting for other
+page resources to finish loading, then
 receives the chapter directly from the viewer's successful server responses,
 closes the window, and resumes. Chapter text and titles stay hidden in ad windows
 to prevent spoilers. The live log reports the automatic Continue click and each
 completed advertisement. Each download worker
 can open its own ad window, so **Threads = 4** allows up to four simultaneous ad
-windows sharing the same signed-in browser profile. If the viewer asks you
+windows sharing the same signed-in browser profile. When a worker finishes its
+chapter, it starts the next queued chapter while other workers continue their
+downloads, advertisements, or recovery attempts. Restore an ad window from
+the taskbar if you need to interact with it. If the viewer asks you
 to sign in, use the same account as the downloader. Closing an ad before it
 finishes reports that chapter as unavailable without repeatedly refreshing
 login. Cancelling the download also closes its ad windows.
@@ -216,8 +220,13 @@ Use an inclusive chapter range from the CLI:
 python3 main.py 49 --start 20 --end 40
 ```
 
-Sequential chapter requests, or pauses between concurrent batches, use a fresh
-random delay between 0.5 and 2.0 seconds by default. Set different bounds with:
+Set **Threads** in the UI or `--threads N` in the CLI to allow up to N chapter
+downloads at once. Each free worker starts the next queued chapter independently.
+An advertisement or recovery attempt keeps its worker occupied while the other
+workers continue.
+
+Each worker waits a fresh random delay before every chapter request, including
+its first request. The default range is 0.5 to 2.0 seconds. Set different bounds with:
 
 ```bash
 python3 main.py 49 --min-interval 1.0 --max-interval 3.0

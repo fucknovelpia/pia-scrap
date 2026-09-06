@@ -137,7 +137,10 @@ class HandoffValidationTests(unittest.TestCase):
 class NativeSetupTests(unittest.TestCase):
     def setUp(self):
         self.addCleanup(patch.stopall)
-        patch.dict(sys.modules, {"System": SimpleNamespace(Action=lambda callback: callback)}).start()
+        patch.dict(sys.modules, {
+            "System": SimpleNamespace(Action=lambda callback: callback),
+            "System.Windows.Forms": SimpleNamespace(FormWindowState=SimpleNamespace(Minimized="minimized")),
+        }).start()
         patch("src.ad_viewer.secrets.token_urlsafe", return_value="test-bridge-token").start()
         self.sequence = []
         self.task = Task()
@@ -152,8 +155,12 @@ class NativeSetupTests(unittest.TestCase):
         )
         self.window = SimpleNamespace(
             events=SimpleNamespace(loaded=Event(), closed=Event()),
-            native=SimpleNamespace(webview=SimpleNamespace(CoreWebView2=self.core)),
-            show=Mock(side_effect=lambda: self.sequence.append("show")),
+            native=SimpleNamespace(
+                webview=SimpleNamespace(CoreWebView2=self.core),
+                WindowState="normal",
+                Show=Mock(side_effect=self.show_native),
+            ),
+            show=Mock(),
             load_url=Mock(side_effect=lambda url: self.sequence.append("navigate")),
         )
         self.window.events.loaded.set()
@@ -165,6 +172,10 @@ class NativeSetupTests(unittest.TestCase):
         self.complete = Mock()
         self.error = Mock()
         self.continued = Mock()
+
+    def show_native(self):
+        self.assertEqual(self.window.native.WindowState, "minimized")
+        self.sequence.append("show")
 
     def tearDown(self):
         for handler in self.window.events.closed.handlers:
@@ -190,6 +201,7 @@ class NativeSetupTests(unittest.TestCase):
         def await_registration(task, timeout, cancelled):
             self.assertEqual(self.sequence, ["register"])
             self.window.show.assert_not_called()
+            self.window.native.Show.assert_not_called()
             self.window.load_url.assert_not_called()
             self.sequence.append("registered")
             return "script-id"
@@ -197,6 +209,7 @@ class NativeSetupTests(unittest.TestCase):
         with patch("src.ad_viewer._wait_task", side_effect=await_registration):
             self.install()
         self.assertEqual(self.sequence, ["register", "registered", "show", "navigate"])
+        self.window.show.assert_not_called()
         self.window.load_url.assert_called_once_with("https://global.novelpia.com/viewer/42")
         self.error.assert_not_called()
 
@@ -205,6 +218,7 @@ class NativeSetupTests(unittest.TestCase):
         self.install()
         self.error.assert_called_once()
         self.window.show.assert_not_called()
+        self.window.native.Show.assert_not_called()
         self.window.load_url.assert_not_called()
 
     def test_late_native_callback_cannot_navigate_after_timeout(self):
