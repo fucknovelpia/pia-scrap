@@ -2,13 +2,12 @@ import html
 import os
 import time
 
-from typing import Dict, List, Optional, Tuple
-from urllib.parse import urlparse
-from bs4 import BeautifulSoup
+from typing import Dict, List, Optional, Set, Tuple
 from ebooklib import epub
 from src.api import NovelpiaClient
 from src.const import BASE_URL
-from src.helper import ensure_dir, kebab, media_type_from_ext, normalize_url
+from src.helper import ensure_dir, kebab
+from src.images import ImageManager
 
 # ----------------------------
 # EPUB Builder
@@ -20,26 +19,11 @@ class EpubBuilder:
         self.debug_dump = debug_dump
         ensure_dir(out_dir)
 
-    def _fetch_bytes(self, client: NovelpiaClient, url: str) -> Optional[bytes]:
-        for attempt in range(1, 4):
-            try:
-                resp = client.s.get(url, timeout=client.timeout)
-                if resp.status_code == 429:
-                    wait = 2.0 * attempt
-                    time.sleep(wait)
-                    continue
-                resp.raise_for_status()
-                return resp.content
-            except Exception:
-                if attempt < 3:
-                    time.sleep(1.0)
-                continue
-        return None
-
     def build(self, client: NovelpiaClient, novel: Dict, episodes: List[Dict],
               filename_hint: Optional[str] = None, language: str = "en",
               author_fallback: str = "Unknown", css_text: Optional[str] = None,
-              novel_id: Optional[int] = None, book_dir: Optional[str] = None) -> Tuple[str, str, int]:
+              novel_id: Optional[int] = None, book_dir: Optional[str] = None,
+              download_images: bool = True) -> Tuple[str, str, int]:
         nv = novel["result"]["novel"]
         result = novel.get("result") or {}
         title = nv.get("novel_name", f"novel_{nv.get('novel_no','')}")
@@ -97,6 +81,15 @@ class EpubBuilder:
             or ""
         ).strip()
 
+        base = kebab(filename_hint or title)
+        target_book_dir = book_dir or os.path.join(self.out_dir, base)
+        ensure_dir(target_book_dir)
+        image_manager = (
+            ImageManager(client.s, target_book_dir, timeout=client.timeout)
+            if download_images
+            else None
+        )
+
         book = epub.EpubBook()
         book.set_identifier(f"novelpia-{nv.get('novel_no')}")
         book.set_title(title)
@@ -110,16 +103,28 @@ class EpubBuilder:
             book.add_metadata("DC", "subject", subject)
 
         # Cover
-        cover_url = normalize_url(nv.get("novel_full_img") or nv.get("novel_img") or "")
+        cover_url = nv.get("novel_full_img") or nv.get("novel_img") or ""
         if cover_url:
-            print("[info] Downloading cover image...")
-        cover_bytes = self._fetch_bytes(client, cover_url) if cover_url else None
+            if image_manager:
+                print("[info] Downloading cover image...")
+            else:
+                print("[info] Image downloads disabled; skipping cover image.")
+        cover_asset = image_manager.download(
+            cover_url,
+            role="cover",
+            context=f"novel:{novel_id or nv.get('novel_no')}",
+            referer=f"{BASE_URL}/novel/{novel_id or nv.get('novel_no')}",
+        ) if image_manager and cover_url else None
         has_cover = False
-        if cover_bytes:
-            book.set_cover("cover.jpg", cover_bytes)
+        cover_epub_path = ""
+        if cover_asset:
+            with open(cover_asset.absolute_path, "rb") as handle:
+                cover_bytes = handle.read()
+            cover_epub_path = f"cover{cover_asset.extension}"
+            book.set_cover(cover_epub_path, cover_bytes)
             has_cover = True
             print("[info] Cover embedded.")
-        elif cover_url:
+        elif cover_url and image_manager:
             print("[warn] Cover could not be downloaded.")
 
         # CSS
@@ -137,43 +142,38 @@ class EpubBuilder:
 
         spine: List = ["nav"]
         toc: List = []
-        image_cache: Dict[str, str] = {}
-        img_index = 1
+        embedded_image_digests: Set[str] = set()
 
-        def add_images_and_rewrite(html_str: str) -> Tuple[str, List[epub.EpubItem]]:
-            nonlocal img_index
-            soup = BeautifulSoup(html_str, "html.parser")
+        def localize_and_embed_images(
+            html_str: str,
+            episode_no: int,
+            image_cookies: Optional[Dict[str, str]] = None,
+        ) -> Tuple[str, List[epub.EpubItem]]:
+            if not image_manager:
+                return html_str, []
+            localized_html, assets = image_manager.localize_html(
+                html_str,
+                episode_no=episode_no,
+                context=f"episode:{episode_no}",
+                referer=f"{BASE_URL}/viewer/{episode_no}",
+                request_cookies=image_cookies,
+            )
             added_items: List[epub.EpubItem] = []
-
-            for img in soup.find_all("img"):
-                src = img.get("src")
-                if not src:
+            for asset in assets:
+                if asset.sha256 in embedded_image_digests:
                     continue
-                src = normalize_url(src)
-                if src in image_cache:
-                    img["src"] = image_cache[src]
-                    continue
-
-                path = urlparse(src).path
-                ext = os.path.splitext(path)[1].lower() or ".jpg"
-                if ext not in (".jpg", ".jpeg", ".png", ".gif", ".webp"):
-                    ext = ".jpg"
-
-                img_bytes = self._fetch_bytes(client, src)
-                if not img_bytes:
-                    # leave external
-                    continue
-
-                fname = f"images/img_{img_index:05d}{ext}"
-                image_cache[src] = fname
-                img_index += 1
-
-                item = epub.EpubItem(uid=f"img{img_index}", file_name=fname,
-                                     media_type=media_type_from_ext(ext), content=img_bytes)
-                added_items.append(item)
-                img["src"] = fname
-
-            return str(soup), added_items
+                with open(asset.absolute_path, "rb") as handle:
+                    payload = handle.read()
+                added_items.append(
+                    epub.EpubItem(
+                        uid=f"image-{asset.sha256[:20]}",
+                        file_name=asset.relative_path,
+                        media_type=asset.media_type,
+                        content=payload,
+                    )
+                )
+                embedded_image_digests.add(asset.sha256)
+            return localized_html, added_items
 
         cached_results: Dict[int, Dict] = {}
         episodes_to_fetch: List[Dict] = []
@@ -199,16 +199,33 @@ class EpubBuilder:
             print(f"[info] Fetching {len(episodes_to_fetch)} uncached/new chapters from Novelpia.")
 
         fetched_count = 0
+        failed_count = 0
+        start_time = time.time()
 
-        def update_pbar(idx, ok):
-            nonlocal fetched_count
+        def update_pbar(idx, ok, res=None):
+            nonlocal fetched_count, failed_count
             fetched_count += 1
-            state = "ok" if ok else "failed"
-            print(f"[progress] Chapter attempt {fetched_count}/{len(episodes_to_fetch)} ({state})")
+            total = len(episodes_to_fetch)
+            pct = fetched_count * 100 // total if total else 100
+            elapsed = time.time() - start_time
+            speed = fetched_count / elapsed * 60 if elapsed > 0 else 0
+            eta_s = (total - fetched_count) / (fetched_count / elapsed) if elapsed > 0 and fetched_count > 0 else 0
+            eta_str = f"{int(eta_s // 60)}m{int(eta_s % 60):02d}s" if eta_s >= 60 else f"{int(eta_s)}s"
+
+            title = ""
+            if res and isinstance(res, dict):
+                title = res.get("epi_title") or ""
+
+            if ok:
+                print(f"  {pct:3d}% | {fetched_count}/{total} | {speed:.1f} ch/min | ETA {eta_str} | + Ch.{idx}: {title}")
+            else:
+                failed_count += 1
+                err = res.get("error", "unknown") if res else "unknown"
+                print(f"  {pct:3d}% | {fetched_count}/{total} | {speed:.1f} ch/min | ETA {eta_str} | x Ch.{idx}: {title} -- {err}")
 
         fetched_results = []
         if episodes_to_fetch:
-            fetched_results = client.fetch_episodes_parallel(episodes_to_fetch, progress_cb=update_pbar)
+            fetched_results = client.fetch_episodes_parallel(episodes_to_fetch, max_workers=client.default_max_workers, progress_cb=update_pbar)
 
         fetched_map: Dict[int, Dict] = {}
         if book_dir:
@@ -234,8 +251,19 @@ class EpubBuilder:
 
             html_text = res["html"]
             epi_title = res["epi_title"]
-            
-            html_text, new_imgs = add_images_and_rewrite(html_text)
+
+            image_cookies = res.get("_image_cookies") or {}
+            if image_manager and not image_cookies and "pv-gn.novelpia.com" in html_text:
+                try:
+                    image_cookies = client.episode_image_cookies(episode_no)
+                except Exception as exc:
+                    print(f"[warn] Could not refresh image access for chapter {i}: {exc}")
+
+            html_text, new_imgs = localize_and_embed_images(
+                html_text,
+                episode_no,
+                image_cookies=image_cookies,
+            )
             print(f"[info] Processed chapter {i}/{len(episodes)}: {epi_title} | embedded images: {len(new_imgs)}")
 
             chapter = epub.EpubHtml(
@@ -270,7 +298,7 @@ class EpubBuilder:
         meta_parts = []
         meta_parts.append(f"<h1>{html.escape(title)}</h1>")
         if has_cover:
-            meta_parts.append("<p><img src='cover.jpg' alt='Cover' style='width:230px;max-width:90%;height:auto;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,.15)'/></p>")
+            meta_parts.append(f"<p><img src='{cover_epub_path}' alt='Cover' style='width:230px;max-width:90%;height:auto;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,.15)'/></p>")
         meta_parts.append(f"<p><strong>Author:</strong> {html.escape(author)}</p>")
         if publisher:
             meta_parts.append(f"<p><strong>Publisher:</strong> {html.escape(publisher)}</p>")
@@ -312,14 +340,32 @@ class EpubBuilder:
         # Spine & CSS
         book.spine = spine
 
-        base = kebab(filename_hint or title)
-        target_book_dir = book_dir or os.path.join(self.out_dir, base)
-        ensure_dir(target_book_dir)
         out_path = os.path.join(target_book_dir, f"{base}.epub")
         print("[info] Writing EPUB file...")
         epub.write_epub(out_path, book, {})
         print(f"[info] EPUB ready: {out_path}")
+        image_summary: Dict = {}
+        if image_manager:
+            image_manager.save_manifest()
+            image_summary = image_manager.summary()
+            print(
+                "[info] Images: "
+                f"{image_summary['image_count']} stored, "
+                f"{image_summary['images_downloaded_this_run']} new, "
+                f"{image_summary['images_reused_this_run']} reused, "
+                f"{image_summary['image_failures']} failed."
+            )
+            for failure in image_manager.failure_messages():
+                print(f"[warn] Image unavailable: {failure}")
         if target_book_dir:
-            from src.builder import write_build_state
-            write_build_state(target_book_dir, novel, novel_id or int(nv.get("novel_no") or 0), episodes, successful_episode_nos)
+            from src.builder import update_image_metadata, write_build_state
+            write_build_state(
+                target_book_dir,
+                novel,
+                novel_id or int(nv.get("novel_no") or 0),
+                episodes,
+                successful_episode_nos,
+                image_summary=image_summary,
+            )
+            update_image_metadata(target_book_dir, image_summary)
         return out_path, title, success_count

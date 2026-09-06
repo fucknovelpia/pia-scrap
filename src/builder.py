@@ -1,10 +1,13 @@
 import json
 import os
+import time
 from typing import Dict, List, Optional
 
 from bs4 import BeautifulSoup
 from src.epub import EpubBuilder
+from src.const import BASE_URL
 from src.helper import ensure_dir, kebab, sanitize_filename
+from src.images import ImageManager
 from src.novel import fetch_novel_and_episodes
 
 # ----------------------------
@@ -78,7 +81,14 @@ def save_cached_episode(book_dir: str, ep: Dict, res: Dict) -> None:
         json.dump(payload, f, ensure_ascii=False)
 
 
-def write_build_state(book_dir: str, data_novel: Dict, novel_id: int, ep_list: List[Dict], successful_episode_nos: List[int]) -> None:
+def write_build_state(
+    book_dir: str,
+    data_novel: Dict,
+    novel_id: int,
+    ep_list: List[Dict],
+    successful_episode_nos: List[int],
+    image_summary: Optional[Dict] = None,
+) -> None:
     nv = data_novel["result"]["novel"]
     writers = data_novel["result"].get("writer_list") or []
     author = (writers[0].get("writer_name") if writers and writers[0].get("writer_name") else "Unknown Author")
@@ -98,9 +108,7 @@ def write_build_state(book_dir: str, data_novel: Dict, novel_id: int, ep_list: L
             }
         )
 
-    save_build_state(
-        book_dir,
-        {
+    state = {
             "novel_id": novel_id,
             "title": nv.get("novel_name"),
             "author": author,
@@ -109,15 +117,27 @@ def write_build_state(book_dir: str, data_novel: Dict, novel_id: int, ep_list: L
             "downloaded_chapter_count": len(downloaded),
             "downloaded_episodes": downloaded,
             "cache_dir": get_cache_dir(book_dir),
-        },
-    )
+        }
+    if image_summary:
+        state["images"] = image_summary
+    save_build_state(book_dir, state)
 
 
 # ----------------------------
 # Main Build Functions
 # ----------------------------
 
-def build_epub(client, novel_id, out_dir, start_chapter=None, end_chapter=None, max_chapters=None, language="en", debug_dump=False):
+def build_epub(
+    client,
+    novel_id,
+    out_dir,
+    start_chapter=None,
+    end_chapter=None,
+    max_chapters=None,
+    language="en",
+    debug_dump=False,
+    download_images=True,
+):
     print(f"[info] Loading novel metadata for {novel_id}...")
     data_novel, ep_list, title = fetch_novel_and_episodes(client, novel_id, start_chapter, end_chapter, max_chapters)
     print(f"[info] Loaded '{title}' with {len(ep_list)} chapters queued.")
@@ -146,27 +166,69 @@ def build_epub(client, novel_id, out_dir, start_chapter=None, end_chapter=None, 
         language=language,
         novel_id=novel_id,
         book_dir=book_dir,
+        download_images=download_images,
     )
 
 
-def build_txt(client, novel_id, out_dir, start_chapter=None, end_chapter=None, max_chapters=None, language="en", debug_dump=False):
+def build_txt(
+    client,
+    novel_id,
+    out_dir,
+    start_chapter=None,
+    end_chapter=None,
+    max_chapters=None,
+    language="en",
+    debug_dump=False,
+    download_images=True,
+):
     print(f"[info] Loading novel metadata for {novel_id}...")
     data_novel, ep_list, title = fetch_novel_and_episodes(client, novel_id, start_chapter, end_chapter, max_chapters)
     print(f"[info] Loaded '{title}' with {len(ep_list)} chapters queued.")
 
     book_dir = get_book_dir(out_dir, title)
     ensure_dir(book_dir)
+    image_manager = (
+        ImageManager(client.s, book_dir, timeout=client.timeout)
+        if download_images
+        else None
+    )
+    nv = data_novel["result"]["novel"]
+    cover_url = nv.get("novel_full_img") or nv.get("novel_img") or ""
+    if image_manager and cover_url:
+        cover_asset = image_manager.download(
+            cover_url,
+            role="cover",
+            context=f"novel:{novel_id}",
+            referer=f"{BASE_URL}/novel/{novel_id}",
+        )
+        if cover_asset:
+            print(f"[info] Cover image saved: {cover_asset.relative_path}")
+        else:
+            print("[warn] Cover could not be downloaded.")
 
     total = 0
     failed = 0
     fetched_count = 0
+    failed_count = 0
     successful_episode_nos: List[int] = []
+    txt_start_time = time.time()
 
-    def update_pbar(idx, ok):
-        nonlocal fetched_count
+    def update_pbar(idx, ok, res=None):
+        nonlocal fetched_count, failed_count
         fetched_count += 1
-        state = "ok" if ok else "failed"
-        print(f"[progress] Chapter attempt {fetched_count}/{len(ep_list)} ({state})")
+        total_ep = len(ep_list)
+        pct = fetched_count * 100 // total_ep if total_ep else 100
+        elapsed = time.time() - txt_start_time
+        speed = fetched_count / elapsed * 60 if elapsed > 0 else 0
+        eta_s = (total_ep - fetched_count) / (fetched_count / elapsed) if elapsed > 0 and fetched_count > 0 else 0
+        eta_str = f"{int(eta_s // 60)}m{int(eta_s % 60):02d}s" if eta_s >= 60 else f"{int(eta_s)}s"
+        title_str = (res.get("epi_title") or "") if res and isinstance(res, dict) else ""
+        if ok:
+            print(f"  {pct:3d}% | {fetched_count}/{total_ep} | {speed:.1f} ch/min | ETA {eta_str} | + Ch.{idx}: {title_str}")
+        else:
+            failed_count += 1
+            err = res.get("error", "unknown") if res else "unknown"
+            print(f"  {pct:3d}% | {fetched_count}/{total_ep} | {speed:.1f} ch/min | ETA {eta_str} | x Ch.{idx}: {title_str} -- {err}")
 
     cached_results: Dict[int, Dict] = {}
     episodes_to_fetch: List[Dict] = []
@@ -188,7 +250,7 @@ def build_txt(client, novel_id, out_dir, start_chapter=None, end_chapter=None, m
 
     fetched_results = []
     if episodes_to_fetch:
-        fetched_results = client.fetch_episodes_parallel(episodes_to_fetch, progress_cb=update_pbar)
+        fetched_results = client.fetch_episodes_parallel(episodes_to_fetch, max_workers=client.default_max_workers, progress_cb=update_pbar)
     fetched_map = {int(ep.get("episode_no")): res for ep, res in zip(episodes_to_fetch, fetched_results)}
 
     for i, ep in enumerate(ep_list, 1):
@@ -203,7 +265,30 @@ def build_txt(client, novel_id, out_dir, start_chapter=None, end_chapter=None, m
         html_text = res["html"]
         epi_title = res["epi_title"]
 
+        if image_manager:
+            image_cookies = res.get("_image_cookies") or {}
+            if not image_cookies and "pv-gn.novelpia.com" in html_text:
+                try:
+                    image_cookies = client.episode_image_cookies(episode_no)
+                except Exception as exc:
+                    print(f"[warn] Could not refresh image access for TXT chapter {i}: {exc}")
+            html_text, chapter_assets = image_manager.localize_html(
+                html_text,
+                episode_no=episode_no,
+                context=f"episode:{episode_no}",
+                referer=f"{BASE_URL}/viewer/{episode_no}",
+                request_cookies=image_cookies,
+            )
+            print(f"[info] Saved {len(chapter_assets)} image(s) for TXT chapter {i}.")
+
         soup = BeautifulSoup(html_text, "html.parser")
+        for image in soup.find_all("img"):
+            source = str(image.get("src") or "").strip()
+            alt = str(image.get("alt") or "").strip()
+            label = f"Image: {alt}" if alt else "Image"
+            if source:
+                label += f" ({source})"
+            image.replace_with(soup.new_string(f"\n[{label}]\n"))
         text = soup.get_text("\n")
 
         fname = f"{i}_{sanitize_filename(epi_title)}.txt"
@@ -215,8 +300,30 @@ def build_txt(client, novel_id, out_dir, start_chapter=None, end_chapter=None, m
         total += 1
         print(f"[info] Wrote TXT chapter {i}: {fname}")
 
+    image_summary: Dict = {}
+    if image_manager:
+        image_manager.save_manifest()
+        image_summary = image_manager.summary()
+        print(
+            "[info] Images: "
+            f"{image_summary['image_count']} stored, "
+            f"{image_summary['images_downloaded_this_run']} new, "
+            f"{image_summary['images_reused_this_run']} reused, "
+            f"{image_summary['image_failures']} failed."
+        )
+        for failure_message in image_manager.failure_messages():
+            print(f"[warn] Image unavailable: {failure_message}")
+
     build_metadata(book_dir, data_novel, novel_id, ep_list, max_chapters)
-    write_build_state(book_dir, data_novel, novel_id, ep_list, successful_episode_nos)
+    update_image_metadata(book_dir, image_summary)
+    write_build_state(
+        book_dir,
+        data_novel,
+        novel_id,
+        ep_list,
+        successful_episode_nos,
+        image_summary=image_summary,
+    )
     print(f"[info] Metadata written under: {book_dir}")
     if failed:
         print(f"[warn] TXT export partial: {total} chapters written, {failed} failed.")
@@ -275,3 +382,17 @@ def build_metadata(book_dir, data_novel, novel_id, ep_list, max_chapters=None):
             epi_title = ep.get("epi_title") or f"Episode {ep.get('epi_num')}"
             rec = {"idx": idx, "episode_no": epi_no, "title": epi_title, "url": f"https://global.novelpia.com/viewer/{epi_no}"}
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
+def update_image_metadata(book_dir: str, image_summary: Optional[Dict]) -> None:
+    if not image_summary:
+        return
+    meta_path = os.path.join(book_dir, "metadata.json")
+    try:
+        with open(meta_path, "r", encoding="utf-8") as handle:
+            metadata = json.load(handle) or {}
+    except (FileNotFoundError, OSError, ValueError):
+        metadata = {}
+    metadata["images"] = image_summary
+    with open(meta_path, "w", encoding="utf-8") as handle:
+        json.dump(metadata, handle, ensure_ascii=False, indent=2)

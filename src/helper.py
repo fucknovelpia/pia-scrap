@@ -74,8 +74,12 @@ def load_config() -> Dict[str, Any]:
 
 def save_config(cfg: Dict[str, Any]) -> None:
     try:
-        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        merged = load_config()
+        merged.update(cfg or {})
+        temporary_path = str(CONFIG_PATH) + ".part"
+        with open(temporary_path, "w", encoding="utf-8") as f:
+            json.dump(merged, f, ensure_ascii=False, indent=2)
+        os.replace(temporary_path, CONFIG_PATH)
     except Exception as e:
         print(f"Error occurred while saving config: {e}")
         pass
@@ -87,7 +91,8 @@ def save_config(cfg: Dict[str, Any]) -> None:
 def merge_login_at(headers: dict, login_at: Optional[str]) -> dict:
     h = dict(headers or {})
     if login_at:
-        h["login-at"] = login_at
+        from urllib.parse import unquote
+        h["login-at"] = unquote(login_at)
     return h
 
 def _mask_value(v: Any) -> Any:

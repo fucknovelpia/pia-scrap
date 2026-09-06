@@ -1,5 +1,5 @@
 from bs4 import BeautifulSoup
-from src.helper import normalize_url
+from src.images import normalize_image_tags
 
 # ----------------------------
 # Novelpia Novel & Episodes Fetcher
@@ -8,14 +8,9 @@ from src.helper import normalize_url
 def html_from_episode_text(raw_html: str) -> str:
     soup = BeautifulSoup(raw_html or "", "html.parser")
 
-    # normalize images
-    for img in soup.find_all("img"):
-        if img.get("data-src") and not img.get("src"):
-            img["src"] = img["data-src"]
-        if "style" in img.attrs:
-            del img["style"]
-        if img.get("src"):
-            img["src"] = normalize_url(img["src"])
+    # Normalize lazy and responsive sources early, while preserving inline styles
+    # so background images can be localized by the output builder.
+    normalize_image_tags(soup)
 
     # Ensure document wrapper
     if not soup.find("html"):
@@ -33,16 +28,10 @@ def html_from_episode_text(raw_html: str) -> str:
     return str(soup)
 
 def fetch_novel_and_episodes(client, novel_id, start_chapter=None, end_chapter=None, max_chapters=None):
-    # Auth check
-    try:
-        res = client.me()
-        if str(res.get("statusCode")) == "200":
-            mem = (((res.get("result") or {}).get("login") or {}).get("mem_nick")) or "Unknown"
-            print(f"[auth] Logged in as: {mem}")
-    except Exception:
-        pass
-
-    print("[info] extracting metadata…")
+    # The API client validates authentication and refreshes expired sessions.
+    # Decoding a JWT locally does not prove login, and must not erase the
+    # session when a refresh temporarily fails.
+    print("[info] extracting metadata...")
     data_novel = client.novel(novel_id)
 
     nv = data_novel["result"]["novel"]

@@ -4,3 +4,5 @@ requests==2.32.*
 tqdm==4.66.*
 python-dotenv==1.0.*
 browser-cookie3==0.20.*
+pywebview>=4.4
+pythonnet>=3.0.0; sys_platform == "win32"

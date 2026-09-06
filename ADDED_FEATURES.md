@@ -207,3 +207,44 @@ Compared to the original version, this cleaned project now supports:
 - richer EPUB metadata
 - reusable local cache for updates
 - easier sharing as a public repository
+
+## 14. Complete Image Pipeline
+
+Added shared image handling across EPUB, TXT, and public-list scraping.
+
+What it adds:
+- cover, inline, lazy-loaded, responsive, and CSS background image discovery
+- authenticated downloads with payload validation, retries, and size limits
+- persistent `images/` assets and an `images.json` inventory
+- content-hash deduplication and reuse across rebuilds
+- offline EPUB embedding and local image markers in TXT chapters
+- optional listing-thumbnail downloads from both the CLI and desktop UI
+- signed-cookie support for Novelpia's protected chapter-image CDN
+- safe placeholders instead of broken external image links on permanent failures
+
+## 15. Chapter Range And Random Intervals
+
+Added inclusive start/end chapter controls to the Download tab and replaced the
+single fixed interval with minimum/maximum controls. Each worker waits a fresh
+random delay before every chapter request, including its first request. The
+configured range defaults to 0.5-2.0 seconds. Download-tab spinboxes ignore mouse-wheel
+events to prevent accidental value changes while scrolling.
+
+Threads sets the maximum number of simultaneous chapter downloads and their
+advertisements. Each worker starts the next queued chapter as soon as it becomes
+free. Recovery attempts stay in the same worker slot while other workers continue.
+
+## 16. Organized Download Tab And Paste Batch
+
+Reorganized the Download tab into consistently spaced Novel Output, Batch
+Source, Download Options, and Actions sections. A new Paste URLs / IDs dialog
+accepts newline-, space-, comma-, or semicolon-separated entries, validates and
+deduplicates them, shows a live valid-novel count, and runs them through the
+same batch pipeline without requiring users to create a text file.
+
+## 17. Live Log Run Animation
+
+Starting a download, batch download, or link scrape now opens the Live Log tab
+automatically, briefly pulses its tab title, and displays an animated activity
+bar for as long as the command is running. The animation resets when the run
+finishes or is cancelled.
