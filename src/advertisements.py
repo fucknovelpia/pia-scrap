@@ -7,6 +7,7 @@ import queue
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 from typing import Callable
 from urllib.parse import urlsplit
 
@@ -17,6 +18,14 @@ from src import const
 
 class AdvertisementError(RuntimeError):
     """An advertisement could not be completed in the official viewer."""
+
+
+@dataclass(frozen=True)
+class AdvertisementResult:
+    """Ticket and content already delivered to the authorized official viewer."""
+
+    ticket: dict
+    content: dict
 
 
 _HOST_LOCK = threading.Lock()
@@ -122,6 +131,7 @@ def _run_ad_host(stop, commands, statuses) -> None:
         except Exception as exc:
             _log_browser_event(f"Runtime load returned {type(exc).__name__}.")
         import webview
+        from src.ad_viewer import install_viewer_handoff
         _log_browser_event("Browser runtime imported.")
 
         # A required OAuth sign-in must stay in this browser's saved profile,
@@ -149,8 +159,8 @@ def _run_ad_host(stop, commands, statuses) -> None:
             try:
                 window = webview.create_window(
                     f"Novelpia -- Advertisement for episode {episode_no}",
-                    f"{const.BASE_URL}/viewer/{episode_no}",
-                    width=1000, height=780,
+                    html="<html><body>Preparing advertisement...</body></html>",
+                    width=1000, height=780, hidden=True,
                 )
 
                 def on_closed() -> None:
@@ -169,7 +179,30 @@ def _run_ad_host(stop, commands, statuses) -> None:
                 with windows_lock:
                     windows[gate_id] = (window, window_closed)
 
+                def on_complete(payload: dict) -> None:
+                    # Deliver the actual browser responses before closing. The
+                    # viewer may have consumed a one-use unlock already.
+                    statuses.put(("complete", gate_id, payload))
+                    _log_browser_event(f"Received viewer content for episode {episode_no}.")
+                    try:
+                        window.hide()
+                    except Exception:
+                        pass
+
+                def on_error() -> None:
+                    if not window_closed.is_set() and not stop.is_set():
+                        _log_browser_event(f"Viewer handoff setup failed for episode {episode_no}.")
+                        statuses.put(("error", gate_id))
+
                 def continue_when_ready() -> None:
+                    try:
+                        install_viewer_handoff(
+                            window, episode_no, on_complete, on_error,
+                            lambda message: _log_browser_event(f"Episode {episode_no}: {message}"),
+                        )
+                    except Exception:
+                        on_error()
+                        return
                     while not window_closed.wait(0.5):
                         if stop.is_set():
                             return
@@ -240,7 +273,7 @@ def _run_ad_host(stop, commands, statuses) -> None:
     except Exception as exc:
         _log_browser_event(f"Advertisement host failed ({type(exc).__name__}).")
         # Native browser errors may include page URLs or session information.
-        # Only fixed status strings cross the process boundary.
+        # Report native failures with fixed status strings only.
         statuses.put(("error", None))
     finally:
         _log_browser_event("Advertisement host finished.")
@@ -268,6 +301,7 @@ def _close_queue(channel) -> None:
 class _AdvertisementHost:
     def __init__(self):
         self.gates = {}
+        self.results = {}
         self.process = None
         self.commands = None
         self.statuses = None
@@ -298,15 +332,21 @@ class _AdvertisementHost:
         # Caller holds _HOST_LOCK; one consumer distributes statuses to gates.
         while True:
             try:
-                status, target = self.statuses.get_nowait()
+                event = self.statuses.get_nowait()
             except queue.Empty:
                 break
+            status, target = event[:2]
             targets = list(self.gates) if target is None else (target,)
             for gate in targets:
-                if gate in self.gates and self.gates[gate] not in ("error", "closed"):
+                if gate not in self.gates:
+                    continue
+                if status == "complete" and target is not None and len(event) == 3:
+                    self.results[gate] = event[2]
+                    self.gates[gate] = "complete"
+                elif self.gates[gate] not in ("complete", "error", "closed"):
                     self.gates[gate] = status
         status = self.gates[gate_id]
-        if status not in ("error", "closed") and not self.process.is_alive():
+        if status not in ("complete", "error", "closed") and not self.process.is_alive():
             return "exited"
         return status
 
@@ -344,6 +384,7 @@ def _unregister_viewer(host, gate_id: str) -> None:
     with _HOST_LOCK:
         if gate_id in host.gates:
             host.gates.pop(gate_id)
+            host.results.pop(gate_id, None)
             host.commands.put(("close", gate_id, None))
         if not host.gates:
             # Finish using the profile before another caller starts a new host.
@@ -359,13 +400,13 @@ def watch_episode_ad(
     is_unlocked: Callable[[requests.Response], bool],
     *,
     timeout: float = 300.0,
-    poll_interval: float = 3.0,
-) -> requests.Response:
-    """Open the real viewer and return only a server-confirmed episode ticket.
+    poll_interval: float = 0.2,
+) -> requests.Response | AdvertisementResult:
+    """Return a pre-existing ticket or the official viewer's authorized content.
 
     A loaded page, elapsed ad timer or closed window never proves completion.
-    ``probe`` must request the episode ticket normally; ``is_unlocked`` must
-    validate both the HTTP status and the successful ticket response body.
+    Once a viewer opens, it owns the ticket/content requests. Polling for another
+    ticket races its one-use unlock and can hang after the chapter has loaded.
     """
     if not isinstance(episode_no, int) or isinstance(episode_no, bool) or episode_no <= 0:
         raise ValueError("Episode number must be a positive integer.")
@@ -394,22 +435,22 @@ def watch_episode_ad(
     host, gate_id = _register_viewer(episode_no, cancelled)
     try:
         deadline = time.monotonic() + timeout
-        next_probe = time.monotonic() + poll_interval
         while True:
             check_cancelled()
             with _HOST_LOCK:
                 status = host.status(gate_id)
+                payload = host.results.get(gate_id)
+            if status == "complete":
+                from src.ad_viewer import validate_handoff
+                if not validate_handoff(payload, episode_no):
+                    raise AdvertisementError("The advertisement viewer returned incomplete episode data. Retry the chapter.")
+                return AdvertisementResult(ticket=payload["ticket"], content=payload["content"])
             if status == "error":
                 raise AdvertisementError(_BROWSER_ERROR)
-            if time.monotonic() >= next_probe or status in ("closed", "exited"):
-                response = unlocked_ticket()
-                if response is not None:
-                    return response
-                next_probe = time.monotonic() + poll_interval
             if status == "closed":
                 raise AdvertisementError(
-                    "The advertisement window closed before Novelpia confirmed "
-                    "that the episode was unlocked. Retry and let the ad finish."
+                    "The advertisement window closed before its chapter was received. "
+                    "Retry and let the ad finish."
                 )
             if status == "exited":
                 exit_code = host.process.exitcode
@@ -421,10 +462,10 @@ def watch_episode_ad(
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise AdvertisementError(
-                    "Novelpia did not confirm the advertisement within "
+                    "The advertisement viewer did not deliver the chapter within "
                     f"{timeout:g} seconds. In the viewer, sign in to the same "
                     "account and allow the advertisement to finish, then retry."
                 )
-            cancelled.wait(min(0.2, remaining))
+            cancelled.wait(min(poll_interval, 0.2, remaining))
     finally:
         _unregister_viewer(host, gate_id)

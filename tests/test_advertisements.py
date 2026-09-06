@@ -14,7 +14,7 @@ from unittest.mock import Mock, patch
 import requests
 
 from src.advertisements import (
-    AdvertisementError, _CONTINUE_AD_JS, _continue_finished_ad, _run_ad_host,
+    AdvertisementError, AdvertisementResult, _CONTINUE_AD_JS, _continue_finished_ad, _run_ad_host,
     _exception_location, _register_viewer, _unregister_viewer, watch_episode_ad,
 )
 
@@ -30,13 +30,31 @@ def is_unlocked(response):
     return response.status_code == 200 and response.json().get("unlocked") is True
 
 
+def handoff(episode_no=670403):
+    return {
+        "episode_no": episode_no,
+        "ticket": {"statusCode": 200, "result": {
+            "_t": f"private-ticket-{episode_no}", "data": {"episode_no": episode_no},
+        }},
+        "content": {"statusCode": 200, "result": {"data": {
+            "epi_content": f"<p>Private chapter body {episode_no}</p>",
+        }}},
+    }
+
+
 class StatusQueue(queue.Queue):
     def __init__(self, statuses=()):
         super().__init__()
+        self.on_put = None
         self.close = Mock()
         self.cancel_join_thread = Mock()
         for status in statuses:
             self.put(status)
+
+    def put(self, item, *args, **kwargs):
+        super().put(item, *args, **kwargs)
+        if self.on_put is not None:
+            self.on_put(item)
 
 
 class FakeProcess:
@@ -94,6 +112,15 @@ class AdvertisementTests(unittest.TestCase):
         self.commands.close.assert_called_once()
         self.commands.cancel_join_thread.assert_called_once()
 
+    def complete_on_open(self, payload, after=()):
+        def publish(command):
+            action, gate_id, _episode_no = command
+            if action == "open":
+                self.statuses.put(("complete", gate_id, payload))
+                for status in after:
+                    self.statuses.put((status, gate_id))
+        self.commands.on_put = publish
+
     def test_rechecks_ticket_before_opening_shared_browser(self):
         unlocked = ticket(200, True)
         probe = Mock(return_value=unlocked)
@@ -101,13 +128,23 @@ class AdvertisementTests(unittest.TestCase):
         probe.assert_called_once_with()
         self.get_context.assert_not_called()
 
-    def test_only_real_probe_success_finishes_viewing_and_closes_browser(self):
+    def test_browser_consumes_one_use_unlock_without_further_api_probes(self):
         self.statuses.put(("ready", None))
-        unlocked = ticket(200, True)
-        probe = Mock(side_effect=[ticket(), ticket(500, True), unlocked])
-        self.assertIs(self.watch(probe), unlocked)
-        self.assertEqual(probe.call_count, 3)
-        self.assertGreaterEqual(self.clock, 106.0)
+        payload = handoff()
+        probe = Mock(side_effect=[ticket(), AssertionError("Unlock has already been consumed")])
+
+        def deliver_after_wait(seconds):
+            self.advance(seconds)
+            if self.clock >= 101.0:
+                command = self.commands.get_nowait()
+                self.statuses.put(("complete", command[1], payload))
+
+        self.cancelled.wait.side_effect = deliver_after_wait
+        result = self.watch(probe)
+        self.assertIsInstance(result, AdvertisementResult)
+        self.assertEqual(result.ticket, payload["ticket"])
+        self.assertEqual(result.content, payload["content"])
+        probe.assert_called_once_with()
         self.get_context.assert_called_once_with("spawn")
         self.context.Process.assert_called_once_with(
             target=_run_ad_host, args=(self.stop, self.commands, self.statuses),
@@ -117,14 +154,17 @@ class AdvertisementTests(unittest.TestCase):
 
     def test_closed_window_does_not_count_as_completion(self):
         self.statuses.put(("closed", None))
-        with self.assertRaisesRegex(AdvertisementError, "closed before Novelpia confirmed"):
+        with self.assertRaisesRegex(AdvertisementError, "closed before its chapter was received"):
             self.watch(Mock(return_value=ticket()))
         self.assert_browser_cleaned_up()
 
-    def test_final_probe_detects_unlock_when_browser_closes_at_same_time(self):
-        self.statuses.put(("closed", None))
-        unlocked = ticket(200, True)
-        self.assertIs(self.watch(Mock(side_effect=[ticket(), unlocked])), unlocked)
+    def test_captured_result_survives_close_error_and_reload_at_same_time(self):
+        payload = handoff()
+        self.complete_on_open(payload, after=("closed", "error", "ready"))
+        probe = Mock(side_effect=[ticket(), AssertionError("Must not fetch another ticket")])
+        result = self.watch(probe)
+        self.assertEqual(result, AdvertisementResult(payload["ticket"], payload["content"]))
+        probe.assert_called_once_with()
         self.assert_browser_cleaned_up()
 
     def test_child_error_is_reported_without_response_or_exception_secrets(self):
@@ -159,15 +199,19 @@ class AdvertisementTests(unittest.TestCase):
 
     def test_page_load_and_elapsed_time_never_count_as_ad_completion(self):
         self.statuses.put(("ready", None))
-        with self.assertRaisesRegex(AdvertisementError, "did not confirm"):
-            self.watch(Mock(return_value=ticket()), timeout=0.6)
+        probe = Mock(return_value=ticket())
+        with self.assertRaisesRegex(AdvertisementError, "did not deliver the chapter"):
+            self.watch(probe, timeout=0.6)
+        probe.assert_called_once_with()
         self.assert_browser_cleaned_up()
 
-    def test_transient_probe_network_errors_are_not_treated_as_completion(self):
-        unlocked = ticket(200, True)
-        probe = Mock(side_effect=[ticket(), requests.Timeout("private-response"), unlocked])
-        self.assertIs(self.watch(probe), unlocked)
-        self.assertEqual(probe.call_count, 3)
+    def test_failed_initial_probe_still_allows_valid_browser_handoff(self):
+        payload = handoff()
+        self.complete_on_open(payload)
+        probe = Mock(side_effect=requests.Timeout("private-response"))
+        result = self.watch(probe)
+        self.assertEqual(result.content, payload["content"])
+        probe.assert_called_once_with()
         self.assert_browser_cleaned_up()
 
     def test_child_exit_is_detected_even_without_close_status(self):
@@ -206,33 +250,86 @@ class AdvertisementTests(unittest.TestCase):
         self.assertFalse(self.stop.is_set())
         for remaining_host, gate in registrations[1:]:
             _unregister_viewer(remaining_host, gate)
+        self.assertEqual(host.results, {})
         self.assert_browser_cleaned_up()
 
-    def test_four_ad_watchers_probe_concurrently_and_wait_for_their_own_ticket(self):
+    def test_four_ad_watchers_receive_their_own_captured_result_concurrently(self):
         patch("src.advertisements.time.monotonic", side_effect=time.perf_counter).start()
         barrier = threading.Barrier(4)
-        unlocked = [ticket(200, True) for _ in range(4)]
+        payloads = [handoff(670403 + index) for index in range(4)]
+        gates = {}
+
+        def record_gate(command):
+            if command[0] == "open":
+                gates[command[2]] = command[1]
+
+        self.commands.on_put = record_gate
 
         def watch_one(index):
-            calls = 0
+            cancelled = threading.Event()
+            probe = Mock(side_effect=[ticket(), AssertionError("One-use unlock already consumed")])
 
-            def probe():
-                nonlocal calls
-                calls += 1
-                if calls == 1:
-                    return ticket()
+            def publish(seconds):
                 barrier.wait(timeout=3)
-                return unlocked[index]
+                self.statuses.put(("complete", gates[670403 + index], payloads[index]))
 
-            return watch_episode_ad(
-                670403 + index, probe, threading.Event(), is_unlocked,
-                poll_interval=0.01, timeout=5,
-            )
+            with patch.object(cancelled, "wait", side_effect=publish):
+                result = watch_episode_ad(
+                    670403 + index, probe, cancelled, is_unlocked,
+                    poll_interval=0.01, timeout=5,
+                )
+            probe.assert_called_once_with()
+            return result
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
             results = list(executor.map(watch_one, range(4)))
-        self.assertEqual(results, unlocked)
+        self.assertEqual(results, [AdvertisementResult(p["ticket"], p["content"]) for p in payloads])
         self.context.Process.assert_called_once()
+        self.assert_browser_cleaned_up()
+
+    def test_malformed_or_mismatched_browser_payload_is_rejected_and_cleaned_up(self):
+        invalid = [None, {}, handoff(670404)]
+        wrong_ticket = handoff()
+        wrong_ticket["ticket"]["result"]["data"]["episode_no"] = 670404
+        empty_content = handoff()
+        empty_content["content"]["result"]["data"] = {}
+        error_content = handoff()
+        error_content["content"]["statusCode"] = 500
+        invalid.extend((wrong_ticket, empty_content, error_content))
+        for payload in invalid:
+            with self.subTest(payload=payload):
+                host = SimpleNamespace(status=Mock(return_value="complete"), results={"gate": payload})
+                with (
+                    patch("src.advertisements._register_viewer", return_value=(host, "gate")),
+                    patch("src.advertisements._unregister_viewer") as cleanup,
+                ):
+                    probe = Mock(return_value=ticket())
+                    with self.assertRaisesRegex(AdvertisementError, "incomplete episode data") as failed:
+                        self.watch(probe)
+                    self.assertNotIn("private-ticket", str(failed.exception))
+                    self.assertNotIn("Private chapter body", str(failed.exception))
+                    cleanup.assert_called_once_with(host, "gate")
+                    probe.assert_called_once_with()
+
+    def test_unrelated_gate_result_does_not_complete_current_episode(self):
+        def publish(command):
+            if command[0] == "open":
+                self.statuses.put(("complete", "unregistered-gate", handoff()))
+        self.commands.on_put = publish
+        with self.assertRaisesRegex(AdvertisementError, "did not deliver"):
+            self.watch(Mock(return_value=ticket()), timeout=0.4)
+        self.assert_browser_cleaned_up()
+
+    def test_completed_payload_is_removed_when_its_gate_is_unregistered(self):
+        host, gate = _register_viewer(670403, self.cancelled)
+        payload = handoff()
+        self.statuses.put(("complete", gate, payload))
+        self.statuses.put(("closed", None))
+        self.assertEqual(host.status(gate), "complete")
+        self.assertIs(host.results[gate], payload)
+        _unregister_viewer(host, gate)
+        self.assertEqual(host.results, {})
+        self.assertEqual(host.gates, {})
         self.assert_browser_cleaned_up()
 
 
@@ -243,6 +340,11 @@ class BrowserEvent:
 
 
 class AdvertisementViewerTests(unittest.TestCase):
+    def setUp(self):
+        installer = patch("src.ad_viewer.install_viewer_handoff")
+        self.install_handoff = installer.start()
+        self.addCleanup(installer.stop)
+
     def test_exception_diagnostics_keep_codes_and_frames_without_private_message(self):
         try:
             raise OSError(9, "session-secret-and-private-url")
@@ -388,10 +490,11 @@ process.stdout.write(JSON.stringify(results));
             _run_ad_host(stop, SimpleNamespace(get=Mock(side_effect=get_command)), statuses)
             calls = webview.create_window.call_args_list
             self.assertTrue(calls[0].kwargs["hidden"])
-            self.assertEqual(calls[1].args[1],
-                             "https://global.novelpia.com/viewer/670403")
-            self.assertEqual(calls[2].args[1],
-                             "https://global.novelpia.com/viewer/670404")
+            for call in calls[1:]:
+                self.assertTrue(call.kwargs["hidden"])
+                self.assertIn("Preparing advertisement", call.kwargs["html"])
+                self.assertEqual(len(call.args), 1)
+                self.assertNotIn("url", call.kwargs)
             self.assertEqual(webview.start.call_args.kwargs, {
                 "debug": False, "private_mode": False,
                 "storage_path": str(Path(directory) / ".webview_data"),
@@ -405,6 +508,53 @@ process.stdout.write(JSON.stringify(results));
         anchor.destroy.assert_called_once_with()
         self.assertFalse(webview.settings["OPEN_EXTERNAL_LINKS_IN_BROWSER"])
         self.assertEqual(statuses.get_nowait(), ("closed", None))
+
+    def test_completed_browser_handoff_hides_viewer_and_keeps_content_out_of_logs(self):
+        stop = threading.Event()
+        completed = threading.Event()
+        statuses = StatusQueue()
+        anchor, viewer = Mock(), Mock()
+        viewer.events = SimpleNamespace(closed=BrowserEvent(), loaded=BrowserEvent())
+        payload = handoff()
+        step = 0
+
+        def install(window, episode_no, on_complete, on_error, on_diagnostic=None):
+            self.assertIs(window, viewer)
+            self.assertEqual(episode_no, 670403)
+            on_complete(payload)
+            completed.set()
+
+        def get_command(timeout):
+            nonlocal step
+            step += 1
+            if step == 1:
+                return ("open", "specific-gate", 670403)
+            if step == 2:
+                self.assertTrue(completed.wait(2))
+                return ("close", "specific-gate", None)
+            stop.set()
+            raise queue.Empty
+
+        self.install_handoff.side_effect = install
+        webview = SimpleNamespace(
+            settings={}, create_window=Mock(side_effect=[anchor, viewer]),
+            start=Mock(side_effect=lambda callback, **kwargs: callback()),
+        )
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch("src.advertisements.const.APP_DIR", Path(directory)),
+            patch.dict("sys.modules", {"webview": webview, "pythonnet": SimpleNamespace(load=Mock())}),
+        ):
+            _run_ad_host(stop, SimpleNamespace(get=Mock(side_effect=get_command)), statuses)
+            log = (Path(directory) / "output" / "logs" / "advertisements.log").read_text(encoding="utf-8")
+        self.assertEqual(statuses.get_nowait(), ("complete", "specific-gate", payload))
+        self.assertEqual(statuses.get_nowait(), ("closed", None))
+        self.assertIn("Received viewer content for episode 670403", log)
+        self.assertNotIn("private-ticket", log)
+        self.assertNotIn("Private chapter body", log)
+        viewer.hide.assert_called_once_with()
+        viewer.destroy.assert_called_once_with()
+        viewer.load_url.assert_not_called()
 
     def test_native_browser_error_exposes_only_fixed_status(self):
         statuses = StatusQueue()

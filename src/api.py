@@ -12,7 +12,7 @@ from src import const
 from src.helper import j, mask_kv, merge_login_at, save_config
 from src.helper import extract_t_token
 from src.novel import html_from_episode_text
-from src.advertisements import AdvertisementError, watch_episode_ad
+from src.advertisements import AdvertisementError, AdvertisementResult, watch_episode_ad
 
 # ----------------------------
 # API Client
@@ -269,6 +269,11 @@ class NovelpiaClient:
                 cancelled=cancel_event,
                 is_unlocked=_has_episode_ticket,
             )
+            if isinstance(r, AdvertisementResult):
+                print(f"[ad] Received episode {episode_no} from the completed advertisement. Resuming download.")
+                data = dict(r.ticket)
+                data["_viewer_content"] = r.content
+                return data
             print(f"[ad] Novelpia unlocked episode {episode_no}. Resuming download.")
         if r.status_code >= 400:
             raise requests.HTTPError(describe_http_error(r), response=r)
@@ -343,7 +348,9 @@ class NovelpiaClient:
 
         # 2) Content
         try:
-            if token_t:
+            if "_viewer_content" in tdata:
+                cdata = tdata["_viewer_content"]
+            elif token_t:
                 cdata = self.episode_content(token_t)
             else:
                 assert direct_url is not None, "direct_url unavailable"

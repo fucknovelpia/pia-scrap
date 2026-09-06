@@ -5,7 +5,7 @@ from unittest.mock import Mock, patch
 
 import requests
 
-from src.advertisements import AdvertisementError
+from src.advertisements import AdvertisementError, AdvertisementResult
 from src.api import NovelpiaClient, _has_episode_ticket, _is_ad_required, cancel_event, request_with_retries
 
 
@@ -65,6 +65,119 @@ class EpisodeAdvertisementTests(unittest.TestCase):
         with patch.object(client, "_episode_ticket_response", return_value=unlocked), patch("src.api.watch_episode_ad") as browser:
             client.episode_ticket(670403)
         browser.assert_not_called()
+
+    @staticmethod
+    def _captured_episode(episode_no):
+        """The viewer already used this ticket while loading the real chapter."""
+        ticket = {
+            "statusCode": 200,
+            "result": {
+                "data": {"episode_no": episode_no},
+                "_t": f"spent-ticket-{episode_no}",
+                "signed_key": {
+                    name: f"{name}-{episode_no}"
+                    for name in NovelpiaClient.IMAGE_COOKIE_NAMES
+                },
+            },
+        }
+        content = {
+            "statusCode": 200,
+            "result": {
+                "data": {
+                    "epi_content": f"<p>Beginning {episode_no}</p>",
+                    "epi_content2": f"<p>Middle {episode_no}</p>",
+                    "epi_content3": f'<p><img src="https://pv-gn.novelpia.com/{episode_no}.png"></p>',
+                    "epi_content4": f"<p>Ending {episode_no}</p>",
+                },
+            },
+        }
+        return AdvertisementResult(ticket=ticket, content=content)
+
+    def test_viewer_consumed_unlock_downloads_captured_content_without_second_request(self):
+        episode_no = 675194
+        client = NovelpiaClient(throttle=0)
+        captured = self._captured_episode(episode_no)
+        with (
+            # Once the browser consumes the reward, every separate ticket
+            # request again returns 0010. The loaded browser response must win.
+            patch.object(client, "_episode_ticket_response", return_value=response()) as ticket,
+            patch("src.api.watch_episode_ad", return_value=captured) as browser,
+            patch.object(client, "episode_content", side_effect=AssertionError("Ticket was already used")) as content,
+            patch.object(client.s, "get", side_effect=AssertionError("Viewer content was already fetched")) as direct,
+        ):
+            result = client.fetch_episode({"episode_no": episode_no, "epi_title": "Ad chapter"}, 3)
+
+        self.assertNotIn("error", result)
+        ticket.assert_called_once_with(episode_no)
+        browser.assert_called_once()
+        content.assert_not_called()
+        direct.assert_not_called()
+        self.assertEqual(result["epi_no"], episode_no)
+        self.assertEqual(result["idx"], 3)
+        self.assertIn(f"Beginning {episode_no}", result["html"])
+        self.assertIn(f"Middle {episode_no}", result["html"])
+        self.assertIn(f"/{episode_no}.png", result["html"])
+        self.assertIn(f"Ending {episode_no}", result["html"])
+        self.assertEqual(result["_image_cookies"], captured.ticket["result"]["signed_key"])
+        self.assertNotIn("_viewer_content", result)
+        self.assertNotIn("spent-ticket", result["html"])
+
+    def test_viewer_handoff_does_not_modify_the_original_ticket_response(self):
+        client = NovelpiaClient(throttle=0)
+        captured = self._captured_episode(675194)
+        original_ticket = json.loads(json.dumps(captured.ticket))
+        with (
+            patch.object(client, "_episode_ticket_response", return_value=response()),
+            patch("src.api.watch_episode_ad", return_value=captured),
+        ):
+            ticket = client.episode_ticket(675194)
+        self.assertIsNot(ticket, captured.ticket)
+        self.assertEqual(ticket["_viewer_content"], captured.content)
+        self.assertEqual(captured.ticket, original_ticket)
+        self.assertEqual(client.signed_image_cookies(ticket), captured.ticket["result"]["signed_key"])
+
+    def test_four_viewer_handoffs_keep_chapter_content_and_signed_cookies_separate(self):
+        workers = 4
+        client = NovelpiaClient(throttle=0, threads=workers)
+        episodes = [
+            {"episode_no": number, "epi_title": f"Chapter {number}"}
+            for number in (675194, 676405, 677072, 678021)
+        ]
+        barrier = threading.Barrier(workers)
+
+        def watch(episode_no, **kwargs):
+            try:
+                barrier.wait(timeout=3)
+            except threading.BrokenBarrierError as exc:
+                raise AdvertisementError("Download workers serialized their ads") from exc
+            return self._captured_episode(episode_no)
+
+        with (
+            patch.object(client, "_episode_ticket_response", return_value=response()) as ticket,
+            patch("src.api.watch_episode_ad", side_effect=watch) as browser,
+            patch.object(client, "episode_content", side_effect=AssertionError("Viewer already fetched content")) as content,
+            patch.object(client, "_recover_episode") as recover,
+        ):
+            results = client.fetch_episodes_parallel(episodes, max_workers=workers)
+
+        self.assertEqual(ticket.call_count, workers)
+        self.assertEqual(browser.call_count, workers)
+        content.assert_not_called()
+        recover.assert_not_called()
+        for index, (episode, result) in enumerate(zip(episodes, results), 1):
+            episode_no = episode["episode_no"]
+            self.assertNotIn("error", result)
+            self.assertEqual(result["epi_no"], episode_no)
+            self.assertEqual(result["idx"], index)
+            self.assertEqual(result["epi_title"], episode["epi_title"])
+            self.assertIn(f"Ending {episode_no}", result["html"])
+            self.assertEqual(
+                result["_image_cookies"],
+                self._captured_episode(episode_no).ticket["result"]["signed_key"],
+            )
+            for other in episodes:
+                if other["episode_no"] != episode_no:
+                    self.assertNotIn(str(other["episode_no"]), result["html"])
 
     def test_http_200_without_episode_token_does_not_confirm_ad_completion(self):
         self.assertFalse(_has_episode_ticket(response(200, "", {"login": {"mem_no": 1}})))
