@@ -42,7 +42,7 @@ class AdRetryDownloadUiTests(unittest.TestCase):
     def launch(self, config=None):
         self.config.return_value = config or {}
         ui.launch_ui()
-        label = self.find(ui.ttk.Label, "Ad retries")
+        label = self.find(ui.ttk.Label, "Retries")
         self.retries = label.master.grid_slaves(row=3, column=1)[0]
         label = self.find(ui.ttk.Label, "Retry cooldown (s)")
         self.cooldown = label.master.grid_slaves(row=4, column=1)[0]
@@ -70,8 +70,10 @@ class AdRetryDownloadUiTests(unittest.TestCase):
             action()
         self.error.assert_not_called()
         args = captured["args"]
-        self.assertEqual(args[args.index("--ad-retries") + 1], "4")
-        self.assertEqual(args[args.index("--ad-retry-cooldown") + 1], "2.5")
+        self.assertEqual(args[args.index("--retries") + 1], "4")
+        self.assertEqual(args[args.index("--retry-cooldown") + 1], "2.5")
+        self.assertNotIn("--ad-retries", args)
+        self.assertNotIn("--ad-retry-cooldown", args)
         self.assertEqual(self.save.call_args.args[0]["ad_retries"], 4)
         self.assertEqual(self.save.call_args.args[0]["ad_retry_cooldown"], 2.5)
         return captured
@@ -80,6 +82,8 @@ class AdRetryDownloadUiTests(unittest.TestCase):
         self.launch({"threads": 2})
         self.assertEqual(self.retries.get(), "10")
         self.assertEqual(float(self.cooldown.get()), 5.0)
+        self.find(ui.ttk.Label, "Chapter and viewer retries (0 disables)")
+        self.find(ui.ttk.Label, "Wait before retrying a failed chapter or viewer page")
         self.prepare_values("0", "1.25")
         self.find(ui.ttk.Button, "Save Settings").invoke()
         self.assertEqual(self.save.call_args.args[0]["ad_retries"], 0)
@@ -114,7 +118,7 @@ class AdRetryDownloadUiTests(unittest.TestCase):
                 with patch.object(ui.threading, "Thread") as thread:
                     self.find(ui.ttk.Button, "Save Settings").invoke()
                     self.find(ui.ttk.Button, "Run File Batch").invoke()
-                self.assertEqual(self.error.call_args.args[0], "Ad retry settings")
+                self.assertEqual(self.error.call_args.args[0], "Retry settings")
                 self.save.assert_not_called()
                 thread.assert_not_called()
 

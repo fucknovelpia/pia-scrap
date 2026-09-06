@@ -243,10 +243,18 @@ class AdRetryCliSettingsTests(unittest.TestCase):
             ({}, [], (10, 5.0)),
             ({"ad_retries": 14, "ad_retry_cooldown": 2.5}, [], (14, 2.5)),
             ({"ad_retries": 14, "ad_retry_cooldown": 2.5},
+             ["--retries", "0", "--retry-cooldown", "0"], (0, 0.0)),
+            ({"ad_retries": 14, "ad_retry_cooldown": 2.5}, ["--retries", "3"], (3, 2.5)),
+            ({"ad_retries": "7", "ad_retry_cooldown": "4.5"},
+             ["--retry-cooldown", "8"], (7, 8.0)),
+            ({"ad_retries": 14, "ad_retry_cooldown": 2.5},
              ["--ad-retries", "0", "--ad-retry-cooldown", "0"], (0, 0.0)),
             ({"ad_retries": 14, "ad_retry_cooldown": 2.5}, ["--ad-retries", "3"], (3, 2.5)),
             ({"ad_retries": "7", "ad_retry_cooldown": "4.5"},
              ["--ad-retry-cooldown", "8"], (7, 8.0)),
+            ({"ad_retries": 14, "ad_retry_cooldown": 2.5},
+             ["--ad-retries", "4", "--retries", "6", "--retry-cooldown", "3",
+              "--ad-retry-cooldown", "1"], (6, 1.0)),
         )
         for config, flags, expected in cases:
             with (
@@ -264,6 +272,11 @@ class AdRetryCliSettingsTests(unittest.TestCase):
 
     def test_invalid_cli_or_saved_retry_values_fail_before_authentication(self):
         cases = (
+            ({}, ["--retries", "1.5"]),
+            ({}, ["--retries", "-1"]),
+            ({}, ["--retry-cooldown", "nan"]),
+            ({}, ["--retry-cooldown", "inf"]),
+            ({}, ["--retry-cooldown", "-1"]),
             ({}, ["--ad-retries", "1.5"]),
             ({}, ["--ad-retries", "-1"]),
             ({}, ["--ad-retry-cooldown", "nan"]),

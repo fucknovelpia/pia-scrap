@@ -381,7 +381,7 @@ def launch_ui() -> None:
                 ad_retries_var.get(), ad_retry_cooldown_var.get(),
             )
         except (tk.TclError, TypeError, ValueError) as exc:
-            messagebox.showerror("Ad retry settings", str(exc))
+            messagebox.showerror("Retry settings", str(exc))
             return None
         try:
             start_chapter = int(start_chapter_var.get())
@@ -657,8 +657,8 @@ def launch_ui() -> None:
             "--threads", str(settings["threads"]),
             "--min-interval", str(settings["min_interval"]),
             "--max-interval", str(settings["max_interval"]),
-            "--ad-retries", str(settings["ad_retries"]),
-            "--ad-retry-cooldown", str(settings["ad_retry_cooldown"]),
+            "--retries", str(settings["ad_retries"]),
+            "--retry-cooldown", str(settings["ad_retry_cooldown"]),
         ]
 
         mode = "TXT" if txt_var.get() else "EPUB"
@@ -726,8 +726,8 @@ def launch_ui() -> None:
             "--threads", str(settings["threads"]),
             "--min-interval", str(settings["min_interval"]),
             "--max-interval", str(settings["max_interval"]),
-            "--ad-retries", str(settings["ad_retries"]),
-            "--ad-retry-cooldown", str(settings["ad_retry_cooldown"]),
+            "--retries", str(settings["ad_retries"]),
+            "--retry-cooldown", str(settings["ad_retry_cooldown"]),
         ]
 
         mode = "TXT" if txt_var.get() else "EPUB"
@@ -1173,7 +1173,7 @@ def launch_ui() -> None:
         justify="left",
     ).grid(row=2, column=2, sticky="w", padx=(18, 0), pady=6)
 
-    ttk.Label(options_section, text="Ad retries", width=18).grid(
+    ttk.Label(options_section, text="Retries", width=18).grid(
         row=3, column=0, sticky="w", padx=(0, 12), pady=6,
     )
     ad_retries_spinbox = ttk.Spinbox(
@@ -1181,7 +1181,7 @@ def launch_ui() -> None:
         textvariable=ad_retries_var, width=7,
     )
     ad_retries_spinbox.grid(row=3, column=1, sticky="w", pady=6)
-    ttk.Label(options_section, text="0 disables automatic ad page retries").grid(
+    ttk.Label(options_section, text="Chapter and viewer retries (0 disables)").grid(
         row=3, column=2, sticky="w", padx=(18, 0), pady=6,
     )
     ttk.Label(options_section, text="Retry cooldown (s)", width=18).grid(
@@ -1192,7 +1192,7 @@ def launch_ui() -> None:
         textvariable=ad_retry_cooldown_var, width=7, format="%.1f",
     )
     ad_retry_cooldown_spinbox.grid(row=4, column=1, sticky="w", pady=6)
-    ttk.Label(options_section, text="Wait before retrying a failed ad page").grid(
+    ttk.Label(options_section, text="Wait before retrying a failed chapter or viewer page").grid(
         row=4, column=2, sticky="w", padx=(18, 0), pady=6,
     )
 

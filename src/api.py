@@ -101,9 +101,10 @@ class NovelpiaClient:
         self._auth_generation = 0
         self.chapter_counter = 0
         self.default_max_workers = max(1, int(threads or 1))
-        self.recover_attempts = 2
-        self.recover_cooldown_min = 3.0
-        self.recover_cooldown_max = 8.0
+        # The Download settings govern both chapter recovery and viewer reloads.
+        self.recover_attempts = self.ad_retries
+        self.recover_cooldown_min = self.ad_retry_cooldown
+        self.recover_cooldown_max = self.ad_retry_cooldown
         self.recover_throttle = 2.0
         self.rotate_session_on_failure = True
         try:
@@ -451,7 +452,7 @@ class NovelpiaClient:
             if (not res) or ("error" in res):
                 err = res.get("error") if res else "Unknown error"
                 print(f"[warn] Chapter {idx} failed on first attempt: {err}")
-                if not res or res.get("retryable", True):
+                if self.recover_attempts > 0 and (not res or res.get("retryable", True)):
                     res = self._recover_episode(ep, idx)
             results[idx - 1] = res
             if progress_cb:
@@ -485,7 +486,7 @@ class NovelpiaClient:
             if not res or "error" in res:
                 err = res.get("error") if res else "Unknown error"
                 print(f"[warn] Chapter {idx} failed: {err}", flush=True)
-                if not res or res.get("retryable", True):
+                if self.recover_attempts > 0 and (not res or res.get("retryable", True)):
                     # Recovery keeps this slot; it cannot block the scheduler
                     # or create an extra download outside the worker limit.
                     res = self._recover_episode(ep, idx)

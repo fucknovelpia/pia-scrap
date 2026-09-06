@@ -214,10 +214,10 @@ def main():
     ap.add_argument("--max-interval", type=float, default=2.0, help="Maximum random delay between episode requests (default: 2.0s)")
     ap.add_argument("--throttle", type=float, default=None, help="Legacy fixed delay; overrides --min-interval and --max-interval")
     ap.add_argument("--threads", type=int, default=1, help="Number of concurrent download threads (default: 1)")
-    ap.add_argument("--ad-retries", type=int, default=None,
-                    help="Automatic ad page retries (0 disables; saved setting or default: 10)")
-    ap.add_argument("--ad-retry-cooldown", type=float, default=None,
-                    help="Seconds before retrying a failed ad page (saved setting or default: 5)")
+    ap.add_argument("--retries", "--ad-retries", dest="ad_retries", type=int, default=None,
+                    help="Chapter and viewer retries (0 disables; saved setting or default: 10)")
+    ap.add_argument("--retry-cooldown", "--ad-retry-cooldown", dest="ad_retry_cooldown", type=float, default=None,
+                    help="Seconds before retrying a failed chapter or viewer page (saved setting or default: 5)")
     ap.add_argument("--txt", "-txt", action="store_true", help="Output plain .txt files per episode instead of EPUB")
     ap.add_argument("--no-images", action="store_true", help="Skip cover and chapter image downloads")
     ap.add_argument("--novel-links-file", help="Read novel links/IDs from a text file and download them one by one")

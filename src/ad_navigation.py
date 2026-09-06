@@ -13,20 +13,20 @@ DEFAULT_AD_LOAD_TIMEOUT = 30.0
 def validate_ad_retry_settings(retries, cooldown) -> tuple[int, float]:
     """Normalize settings from the GUI, command line or saved configuration."""
     if isinstance(retries, bool) or isinstance(cooldown, bool):
-        raise ValueError("Ad retries and cooldown must be numbers, not booleans.")
+        raise ValueError("Retries and cooldown must be numbers, not booleans.")
     try:
         number = Decimal(str(retries))
         if not number.is_finite() or number < 0 or number != number.to_integral_value():
             raise ValueError
         normalized_retries = int(number)
     except (InvalidOperation, TypeError, ValueError, OverflowError):
-        raise ValueError("Ad retries must be a nonnegative whole number.") from None
+        raise ValueError("Retries must be a nonnegative whole number.") from None
     try:
         normalized_cooldown = float(cooldown)
         if not math.isfinite(normalized_cooldown) or normalized_cooldown < 0:
             raise ValueError
     except (TypeError, ValueError, OverflowError):
-        raise ValueError("Ad retry cooldown must be a finite, nonnegative number of seconds.") from None
+        raise ValueError("Retry cooldown must be a finite, nonnegative number of seconds.") from None
     return normalized_retries, normalized_cooldown
 
 
