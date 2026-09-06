@@ -36,6 +36,7 @@ a = Analysis(
         'src.api',
         'src.advertisements',
         'src.ad_viewer',
+        'src.ad_navigation',
         'src.ad_continue',
         'src.builder',
         'src.chrome_session',

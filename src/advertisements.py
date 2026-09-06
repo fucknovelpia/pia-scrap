@@ -144,12 +144,17 @@ def _run_ad_host(stop, commands, statuses) -> None:
                     statuses.put(("continued", gate_id))
                     _log_browser_event(f"Auto-clicked Continue for episode {episode_no}.")
 
+                def on_navigation_status(status: str) -> None:
+                    if status in ("retrying", "load_error"):
+                        statuses.put((status, gate_id))
+
                 def prepare_viewer() -> None:
                     try:
                         install_viewer_handoff(
                             window, episode_no, on_complete, on_error,
                             lambda message: _log_browser_event(f"Episode {episode_no}: {message}"),
                             on_continue=on_continue,
+                            on_navigation_status=on_navigation_status,
                         )
                     except Exception:
                         on_error()
@@ -246,6 +251,7 @@ class _AdvertisementHost:
         self.gates = {}
         self.results = {}
         self.continue_counts = {}
+        self.recovery_counts = {}
         self.process = None
         self.commands = None
         self.statuses = None
@@ -286,13 +292,15 @@ class _AdvertisementHost:
                     continue
                 if status == "continued" and target is not None:
                     self.continue_counts[gate] = self.continue_counts.get(gate, 0) + 1
+                elif status == "retrying" and target is not None:
+                    self.recovery_counts[gate] = self.recovery_counts.get(gate, 0) + 1
                 elif status == "complete" and target is not None and len(event) == 3:
                     self.results[gate] = event[2]
                     self.gates[gate] = "complete"
-                elif self.gates[gate] not in ("complete", "error", "closed"):
+                elif self.gates[gate] not in ("complete", "error", "load_error", "closed"):
                     self.gates[gate] = status
         status = self.gates[gate_id]
-        if status not in ("complete", "error", "closed") and not self.process.is_alive():
+        if status not in ("complete", "error", "load_error", "closed") and not self.process.is_alive():
             return "exited"
         return status
 
@@ -320,6 +328,7 @@ def _register_viewer(episode_no: int, cancelled: threading.Event):
         gate_id = uuid.uuid4().hex
         host.gates[gate_id] = "opening"
         host.continue_counts[gate_id] = 0
+        host.recovery_counts[gate_id] = 0
         host.commands.put(("open", gate_id, episode_no))
         return host, gate_id
     finally:
@@ -333,6 +342,7 @@ def _unregister_viewer(host, gate_id: str) -> None:
             host.gates.pop(gate_id)
             host.results.pop(gate_id, None)
             host.continue_counts.pop(gate_id, None)
+            host.recovery_counts.pop(gate_id, None)
             host.commands.put(("close", gate_id, None))
         if not host.gates:
             # Finish using the profile before another caller starts a new host.
@@ -384,15 +394,20 @@ def watch_episode_ad(
     try:
         deadline = time.monotonic() + timeout
         reported_continues = 0
+        reported_recoveries = 0
         while True:
             check_cancelled()
             with _HOST_LOCK:
                 status = host.status(gate_id)
                 payload = host.results.get(gate_id)
                 continue_count = host.continue_counts.get(gate_id, 0)
+                recovery_count = host.recovery_counts.get(gate_id, 0)
             if continue_count > reported_continues:
                 print(f"[ad] Episode {episode_no}: Continue auto-clicked. Waiting for chapter...", flush=True)
                 reported_continues = continue_count
+            if recovery_count > reported_recoveries:
+                print(f"[ad] Episode {episode_no}: Viewer page failed to load; retrying automatically (attempt {recovery_count}/2).", flush=True)
+                reported_recoveries = recovery_count
             if status == "complete":
                 from src.ad_viewer import validate_handoff
                 if not validate_handoff(payload, episode_no):
@@ -400,6 +415,11 @@ def watch_episode_ad(
                 return AdvertisementResult(ticket=payload["ticket"], content=payload["content"])
             if status == "error":
                 raise AdvertisementError(_BROWSER_ERROR)
+            if status == "load_error":
+                raise AdvertisementError(
+                    "The official viewer could not load this chapter after automatic retries. "
+                    "Try again later. Details: output/logs/advertisements.log."
+                )
             if status == "closed":
                 raise AdvertisementError(
                     "The advertisement window closed before its chapter was received. "

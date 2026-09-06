@@ -1,6 +1,6 @@
 # pia-scrap
 
-Current version: **1.3.0**
+Current version: **1.3.1**
 
 Novelpia downloader with:
 - EPUB export
@@ -134,7 +134,11 @@ page resources to finish loading, then
 receives the chapter directly from the viewer's successful server responses,
 closes the window, and resumes. Chapter text and titles stay hidden in ad windows
 to prevent spoilers. The live log reports the automatic Continue click and each
-completed advertisement. Each download worker
+completed advertisement. Viewer page failures are automatically retried up to
+twice, without restarting a
+healthy ad countdown. The temporary preparation page is removed from browser
+history, so a failed post-ad navigation cannot return to it and stall.
+Each download worker
 can open its own ad window, so **Threads = 4** allows up to four simultaneous ad
 windows sharing the same signed-in browser profile. When a worker finishes its
 chapter, it starts the next queued chapter while other workers continue their

@@ -158,7 +158,7 @@ class AdvertisementTests(unittest.TestCase):
 
     def test_captured_result_survives_close_error_and_reload_at_same_time(self):
         payload = handoff()
-        self.complete_on_open(payload, after=("closed", "error", "ready"))
+        self.complete_on_open(payload, after=("closed", "error", "load_error", "ready"))
         probe = Mock(side_effect=[ticket(), AssertionError("Must not fetch another ticket")])
         result = self.watch(probe)
         self.assertEqual(result, AdvertisementResult(payload["ticket"], payload["content"]))
@@ -296,7 +296,7 @@ class AdvertisementTests(unittest.TestCase):
         invalid.extend((wrong_ticket, empty_content, error_content))
         for payload in invalid:
             with self.subTest(payload=payload):
-                host = SimpleNamespace(status=Mock(return_value="complete"), results={"gate": payload}, continue_counts={})
+                host = SimpleNamespace(status=Mock(return_value="complete"), results={"gate": payload}, continue_counts={}, recovery_counts={})
                 with (
                     patch("src.advertisements._register_viewer", return_value=(host, "gate")),
                     patch("src.advertisements._unregister_viewer") as cleanup,
@@ -329,6 +329,7 @@ class AdvertisementTests(unittest.TestCase):
         self.assertEqual(host.results, {})
         self.assertEqual(host.gates, {})
         self.assertEqual(host.continue_counts, {})
+        self.assertEqual(host.recovery_counts, {})
         self.assert_browser_cleaned_up()
 
     def test_continue_notification_survives_page_reload_and_reaches_live_log(self):
@@ -344,6 +345,27 @@ class AdvertisementTests(unittest.TestCase):
         self.assertIsInstance(result, AdvertisementResult)
         output.assert_called_once_with(
             "[ad] Episode 670403: Continue auto-clicked. Waiting for chapter...", flush=True,
+        )
+        self.assert_browser_cleaned_up()
+
+    def test_page_load_failure_reports_retries_without_waiting_for_ad_timeout(self):
+        def publish(command):
+            if command[0] == "open":
+                gate = command[1]
+                self.statuses.put(("retrying", gate))
+                self.statuses.put(("retrying", gate))
+                self.statuses.put(("load_error", gate))
+                self.statuses.put(("ready", gate))
+                self.statuses.put(("closed", gate))
+        self.commands.on_put = publish
+        probe = Mock(return_value=ticket())
+        with patch("builtins.print") as output:
+            with self.assertRaisesRegex(AdvertisementError, "could not load this chapter after automatic retries"):
+                self.watch(probe)
+        self.assertEqual(self.clock, 100)
+        probe.assert_called_once_with()
+        output.assert_called_once_with(
+            "[ad] Episode 670403: Viewer page failed to load; retrying automatically (attempt 2/2).", flush=True,
         )
         self.assert_browser_cleaned_up()
 
@@ -457,7 +479,7 @@ class AdvertisementViewerTests(unittest.TestCase):
         payload = handoff()
         step = 0
 
-        def install(window, episode_no, on_complete, on_error, on_diagnostic=None, on_continue=None):
+        def install(window, episode_no, on_complete, on_error, on_diagnostic=None, on_continue=None, on_navigation_status=None):
             self.assertIs(window, viewer)
             self.assertEqual(episode_no, 670403)
             on_continue()

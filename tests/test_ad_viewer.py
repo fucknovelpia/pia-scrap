@@ -135,6 +135,13 @@ class HandoffValidationTests(unittest.TestCase):
 
 
 class NativeSetupTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        # Keep imports made by the viewer daemon outside each sys.modules
+        # snapshot; cleanup must not remove a module during its first import.
+        import src.ad_navigation
+        import src.ad_continue
+
     def setUp(self):
         self.addCleanup(patch.stopall)
         patch.dict(sys.modules, {
@@ -144,14 +151,17 @@ class NativeSetupTests(unittest.TestCase):
         patch("src.ad_viewer.secrets.token_urlsafe", return_value="test-bridge-token").start()
         self.sequence = []
         self.task = Task()
+        self.read_script = Mock(return_value=SimpleNamespace(
+            IsCompleted=True, IsFaulted=False, IsCanceled=False, Result="null",
+        ))
         self.core = SimpleNamespace(
             WebResourceResponseReceived=Event(),
             WebMessageReceived=Event(),
+            NavigationStarting=Event(),
+            NavigationCompleted=Event(),
             AddScriptToExecuteOnDocumentCreatedAsync=Mock(side_effect=self.register_script),
             Source="https://global.novelpia.com/viewer/42",
-            ExecuteScriptAsync=Mock(return_value=SimpleNamespace(
-                IsCompleted=True, IsFaulted=False, IsCanceled=False, Result="null",
-            )),
+            ExecuteScriptAsync=Mock(side_effect=self.execute_script),
         )
         self.window = SimpleNamespace(
             events=SimpleNamespace(loaded=Event(), closed=Event()),
@@ -177,6 +187,12 @@ class NativeSetupTests(unittest.TestCase):
         self.assertEqual(self.window.native.WindowState, "minimized")
         self.sequence.append("show")
 
+    def execute_script(self, script):
+        if script.startswith("window.location.replace("):
+            self.sequence.append("navigate")
+            return SimpleNamespace(IsCompleted=True, IsFaulted=False, IsCanceled=False, Result="null")
+        return self.read_script(script)
+
     def tearDown(self):
         for handler in self.window.events.closed.handlers:
             handler()
@@ -199,6 +215,8 @@ class NativeSetupTests(unittest.TestCase):
 
     def test_observer_and_document_start_registration_finish_before_navigation(self):
         def await_registration(task, timeout, cancelled):
+            if task is not self.task:
+                return task.Result
             self.assertEqual(self.sequence, ["register"])
             self.window.show.assert_not_called()
             self.window.native.Show.assert_not_called()
@@ -210,7 +228,9 @@ class NativeSetupTests(unittest.TestCase):
             self.install()
         self.assertEqual(self.sequence, ["register", "registered", "show", "navigate"])
         self.window.show.assert_not_called()
-        self.window.load_url.assert_called_once_with("https://global.novelpia.com/viewer/42")
+        self.window.load_url.assert_not_called()
+        self.assertEqual(self.window.real_url, "https://global.novelpia.com/viewer/42")
+        self.core.ExecuteScriptAsync.assert_any_call('window.location.replace("https://global.novelpia.com/viewer/42");')
         self.error.assert_not_called()
 
     def test_failed_script_registration_never_exposes_or_navigates_viewer(self):
@@ -326,7 +346,7 @@ class NativeSetupTests(unittest.TestCase):
             IsCompleted=False, IsFaulted=False, IsCanceled=False,
             Result=json.dumps(ticket()),
         )
-        self.core.ExecuteScriptAsync.return_value = hydration
+        self.read_script.return_value = hydration
         done = threading.Event()
         self.complete.side_effect = lambda payload: done.set()
         self.install()
@@ -348,11 +368,299 @@ class NativeSetupTests(unittest.TestCase):
         hydration.IsCompleted = True
         self.assertTrue(done.wait(1))
         self.assertTrue(validate_handoff(self.complete.call_args.args[0], 42))
-        self.assertIn("viewer_", self.core.ExecuteScriptAsync.call_args.args[0])
+        self.assertIn("viewer_", self.read_script.call_args.args[0])
+
+    def test_return_to_neutral_after_viewer_retries_without_waiting_for_ad_timeout(self):
+        from src.ad_navigation import ViewerNavigationWatchdog
+
+        first_read = threading.Event()
+        retried = threading.Event()
+        statuses = []
+        ad_body = {"__pia_viewer_state": "ad"}
+
+        def read_ad(_script):
+            first_read.set()
+            return SimpleNamespace(IsCompleted=True, IsFaulted=False, IsCanceled=False, Result=json.dumps(ad_body))
+
+        def navigate(script):
+            task = self.execute_script(script)
+            if script.startswith("window.location.replace("):
+                navigation_id = self.sequence.count("navigate")
+                self.core.NavigationStarting.handlers[0](self.core, SimpleNamespace(
+                    Uri="https://global.novelpia.com/viewer/42", NavigationId=navigation_id,
+                ))
+                self.core.Source = "https://global.novelpia.com/viewer/42"
+                self.core.NavigationCompleted.handlers[0](self.core, SimpleNamespace(
+                    NavigationId=navigation_id, IsSuccess=True, WebErrorStatus="Unknown",
+                ))
+                if navigation_id == 2:
+                    retried.set()
+            return task
+
+        self.read_script.side_effect = read_ad
+        self.core.ExecuteScriptAsync.side_effect = navigate
+        with patch("src.ad_navigation.ViewerNavigationWatchdog", side_effect=lambda now: ViewerNavigationWatchdog(now, retry_delay=0)):
+            install_viewer_handoff(self.window, 42, self.complete, self.error, on_navigation_status=statuses.append)
+            self.assertTrue(first_read.wait(1))
+            self.core.NavigationStarting.handlers[0](self.core, SimpleNamespace(
+                Uri="about:blank", NavigationId=10,
+            ))
+            self.core.Source = "about:blank"
+            self.core.NavigationCompleted.handlers[0](self.core, SimpleNamespace(
+                NavigationId=10, IsSuccess=True, WebErrorStatus="Unknown",
+            ))
+            self.assertTrue(retried.wait(2), "Returning to the preparation page was not recovered promptly")
+        self.assertEqual(statuses, ["retrying"])
+        self.assertEqual(self.sequence.count("navigate"), 2)
+        self.complete.assert_not_called()
+        self.error.assert_not_called()
+
+    def test_native_navigation_failure_while_neutral_has_bounded_page_error(self):
+        from src.ad_navigation import ViewerNavigationWatchdog
+
+        statuses = []
+        finished = threading.Event()
+        original_execute = self.execute_script
+
+        def fail_navigation(script):
+            task = original_execute(script)
+            if script.startswith("window.location.replace("):
+                # A failed first navigation can retain about:blank; it has
+                # never reached the viewer, so this must use the native error.
+                navigation_id = self.sequence.count("navigate")
+                self.core.NavigationStarting.handlers[0](self.core, SimpleNamespace(
+                    Uri="https://global.novelpia.com/viewer/42", NavigationId=navigation_id,
+                ))
+                self.core.Source = "about:blank"
+                self.core.NavigationCompleted.handlers[0](
+                    self.core, SimpleNamespace(NavigationId=navigation_id, IsSuccess=False,
+                                               WebErrorStatus="HostNameNotResolved"),
+                )
+            return task
+
+        def status(value):
+            statuses.append(value)
+            if value == "load_error":
+                finished.set()
+
+        self.core.ExecuteScriptAsync.side_effect = fail_navigation
+        with patch("src.ad_navigation.ViewerNavigationWatchdog", side_effect=lambda now: ViewerNavigationWatchdog(now, load_timeout=30, retry_delay=0)):
+            install_viewer_handoff(self.window, 42, self.complete, self.error, on_navigation_status=status)
+            self.assertTrue(finished.wait(3), "Known native navigation failure used the ordinary load timeout")
+        self.assertEqual(statuses, ["retrying", "retrying", "load_error"])
+        self.assertEqual(self.sequence.count("navigate"), 3)
+        self.complete.assert_not_called()
+        self.error.assert_not_called()
+
+    def test_stale_navigation_completion_does_not_fail_newer_navigation(self):
+        from src.ad_navigation import ViewerNavigationWatchdog
+
+        observed = threading.Event()
+        states = []
+        diagnostics = []
+        status = Mock()
+
+        class RecordingWatchdog(ViewerNavigationWatchdog):
+            def observe(watchdog, state, now):
+                states.append(state)
+                action = super().observe(state, now)
+                if len(states) >= 2:
+                    observed.set()
+                return action
+
+        def navigate(script):
+            task = self.execute_script(script)
+            if script.startswith("window.location.replace("):
+                for navigation_id in (1, 2):
+                    self.core.NavigationStarting.handlers[0](self.core, SimpleNamespace(
+                        Uri="https://global.novelpia.com/viewer/42", NavigationId=navigation_id,
+                    ))
+                # The superseded document can report either a failure or a
+                # successful completion after the replacement has started.
+                for success in (False, True):
+                    self.core.NavigationCompleted.handlers[0](self.core, SimpleNamespace(
+                        NavigationId=1, IsSuccess=success, WebErrorStatus="ConnectionAborted",
+                    ))
+            return task
+
+        self.core.ExecuteScriptAsync.side_effect = navigate
+        self.read_script.return_value = SimpleNamespace(
+            IsCompleted=True, IsFaulted=False, IsCanceled=False,
+            Result=json.dumps({"__pia_viewer_state": "ad"}),
+        )
+        with patch("src.ad_navigation.ViewerNavigationWatchdog", side_effect=lambda now: RecordingWatchdog(now, retry_delay=0)):
+            install_viewer_handoff(self.window, 42, self.complete, self.error, diagnostics.append,
+                                   on_navigation_status=status)
+            self.assertTrue(observed.wait(2))
+            self.assertFalse(any("navigation finished" in item for item in diagnostics))
+            self.core.NavigationCompleted.handlers[0](self.core, SimpleNamespace(
+                NavigationId=2, IsSuccess=True, WebErrorStatus="Unknown",
+            ))
+        self.assertEqual(states, ["ad", "ad"])
+        self.assertEqual(sum("navigation finished" in item for item in diagnostics), 1)
+        self.assertEqual(self.sequence.count("navigate"), 1)
+        status.assert_not_called()
+        self.error.assert_not_called()
+
+    def test_stale_ssr_error_during_navigation_uses_load_timeout(self):
+        from src.ad_navigation import ViewerNavigationWatchdog
+
+        observations = []
+        retried = threading.Event()
+        statuses = []
+        watchdog = ViewerNavigationWatchdog(0, load_timeout=30, retry_delay=5)
+        observed_times = iter((0, 6, 29, 30))
+
+        def observe(state, _now):
+            instant = next(observed_times)
+            action = watchdog.observe(state, instant)
+            observations.append((state, instant, action))
+            return action
+
+        def navigate(script):
+            task = self.execute_script(script)
+            if script.startswith("window.location.replace("):
+                navigation_id = self.sequence.count("navigate")
+                self.core.NavigationStarting.handlers[0](self.core, SimpleNamespace(
+                    Uri="https://global.novelpia.com/viewer/42", NavigationId=navigation_id,
+                ))
+                # Leave navigation pending while the old document's Nuxt
+                # payload still reports its server error.
+                if navigation_id == 2:
+                    retried.set()
+            return task
+
+        self.core.ExecuteScriptAsync.side_effect = navigate
+        self.read_script.return_value = SimpleNamespace(
+            IsCompleted=True, IsFaulted=False, IsCanceled=False,
+            Result=json.dumps({"__pia_viewer_state": "error", "status": 500, "code": "0034"}),
+        )
+        with patch("src.ad_navigation.ViewerNavigationWatchdog", return_value=SimpleNamespace(observe=observe)):
+            install_viewer_handoff(self.window, 42, self.complete, self.error, on_navigation_status=statuses.append)
+            self.assertTrue(retried.wait(3))
+        self.assertEqual(observations, [
+            ("loading", 0, None), ("loading", 6, None),
+            ("loading", 29, None), ("loading", 30, "retry"),
+        ])
+        self.assertEqual(statuses, ["retrying"])
+        self.assertEqual(self.sequence.count("navigate"), 2)
+        self.error.assert_not_called()
+
+    def test_trusted_sign_in_pages_are_interactive_without_navigation_retry(self):
+        from src.ad_navigation import ViewerNavigationWatchdog
+
+        login_urls = (
+            "https://accounts.google.com/v3/signin/identifier",
+            "https://global.novelpia.com/login",
+            "https://global.novelpia.com/auth/callback",
+        )
+        self.core.Source = login_urls[0]
+        observed = threading.Event()
+        states = []
+        status = Mock()
+
+        class RecordingWatchdog(ViewerNavigationWatchdog):
+            def observe(watchdog, state, now):
+                states.append(state)
+                action = super().observe(state, now)
+                if len(states) < len(login_urls):
+                    self.core.Source = login_urls[len(states)]
+                else:
+                    observed.set()
+                return action
+
+        with patch("src.ad_navigation.ViewerNavigationWatchdog", side_effect=lambda now: RecordingWatchdog(now - 1000, load_timeout=0.001, retry_delay=0)):
+            install_viewer_handoff(self.window, 42, self.complete, self.error, on_navigation_status=status)
+            self.assertTrue(observed.wait(2))
+        self.assertEqual(states, ["interactive"] * len(login_urls))
+        self.assertEqual(self.sequence.count("navigate"), 1)
+        self.read_script.assert_not_called()
+        status.assert_not_called()
+        self.error.assert_not_called()
+
+    def test_healthy_ad_marker_does_not_trigger_navigation_retry(self):
+        from src.ad_navigation import ViewerNavigationWatchdog
+
+        observed = threading.Event()
+        reads = 0
+        status = Mock()
+
+        def read_ad(_script):
+            nonlocal reads
+            reads += 1
+            if reads >= 3:
+                observed.set()
+            return SimpleNamespace(IsCompleted=True, IsFaulted=False, IsCanceled=False,
+                                   Result=json.dumps({"__pia_viewer_state": "ad"}))
+
+        self.read_script.side_effect = read_ad
+        with patch("src.ad_navigation.ViewerNavigationWatchdog", side_effect=lambda now: ViewerNavigationWatchdog(now - 1000, load_timeout=0.001, retry_delay=0)):
+            install_viewer_handoff(self.window, 42, self.complete, self.error, on_navigation_status=status)
+            self.assertTrue(observed.wait(2))
+        status.assert_not_called()
+        self.assertEqual(self.sequence.count("navigate"), 1)
+        self.complete.assert_not_called()
+        self.error.assert_not_called()
+
+    def test_late_navigation_failure_cannot_override_delivered_chapter(self):
+        status = Mock()
+        done = threading.Event()
+        self.complete.side_effect = lambda payload: done.set()
+        self.read_script.return_value = SimpleNamespace(
+            IsCompleted=True, IsFaulted=False, IsCanceled=False, Result=json.dumps(ticket()),
+        )
+        install_viewer_handoff(self.window, 42, self.complete, self.error, on_navigation_status=status)
+        response = SimpleNamespace(StatusCode=200, GetContentAsync=Mock(return_value=Task()))
+        args = SimpleNamespace(Request=SimpleNamespace(Uri=API + "/content?_t=real-token"), Response=response)
+        with patch("src.ad_viewer._read_response", return_value=content()):
+            self.core.WebResourceResponseReceived.handlers[0](self.core, args)
+            self.assertTrue(done.wait(1))
+        self.core.Source = "about:blank"
+        self.core.NavigationCompleted.handlers[0](
+            self.core, SimpleNamespace(IsSuccess=False, WebErrorStatus="ConnectionAborted"),
+        )
+        self.complete.assert_called_once()
+        self.assertTrue(validate_handoff(self.complete.call_args.args[0], 42))
+        status.assert_not_called()
+        self.error.assert_not_called()
 
 
 @unittest.skipUnless(shutil.which("node"), "Node is needed to execute the document-start guard")
 class SpoilerGuardTests(unittest.TestCase):
+    def test_ssr_errors_are_sanitized_and_valid_later_ticket_beats_stale_ad(self):
+        script = _SSR_TICKET_JS.replace("__EPISODE_PATH__", '"/viewer/42"').replace("__EPISODE_NO__", "42")
+        harness = r"""
+const vm = require('vm');
+const script = JSON.parse(process.argv[1]);
+function run(first, second) {
+  const window = {__NUXT__: {data: {viewer_42: first}}}; window.top = window;
+  const app = {config: {globalProperties: {$nuxt: {payload: {data: {viewer_42: second}}}}}};
+  return vm.runInNewContext(script, {window,
+    location: {origin: 'https://global.novelpia.com', pathname: '/viewer/42'},
+    document: {querySelector: () => ({__vue_app__: app})}});
+}
+const secretError = {statusCode: 500, code: 'PRIVATE_TOKEN', errmsg: 'PRIVATE_ACCOUNT_MESSAGE',
+  result: {_t: 'PRIVATE_SESSION', data: {episode_no: 42, epi_content: 'PRIVATE_CHAPTER'}}};
+const ad = {...secretError, code: '0010'};
+const valid = {statusCode: 200, result: {_t: 'actual-ticket', data: {episode_no: 42}}};
+console.log(JSON.stringify([
+  run(secretError, null), run(ad, null), run(ad, valid), run(secretError, valid),
+  run({...secretError, code: '0034'}, null),
+  run({...secretError, code: '0001', result: {...secretError.result, name: 'AUTH_ERROR'}}, null),
+  run({...secretError, code: '0001', result: {...secretError.result, name: 'OTHER_ERROR'}}, null)
+]));
+"""
+        process = subprocess.run([shutil.which("node"), "-e", harness, json.dumps(script)], capture_output=True, text=True, check=True)
+        results = json.loads(process.stdout)
+        self.assertEqual(results[0], {"__pia_viewer_state": "error", "status": 500, "code": ""})
+        self.assertEqual(results[1], {"__pia_viewer_state": "ad"})
+        self.assertEqual(results[2]["result"]["_t"], "actual-ticket")
+        self.assertEqual(results[2], results[3])
+        self.assertEqual(results[4], {"__pia_viewer_state": "error", "status": 500, "code": "0034"})
+        self.assertEqual(results[5], {"__pia_viewer_state": "interactive"})
+        self.assertEqual(results[6], {"__pia_viewer_state": "error", "status": 500, "code": "0001"})
+        self.assertNotIn("PRIVATE_", process.stdout)
+
     def test_reads_only_the_matching_hydrated_server_ticket(self):
         script = _SSR_TICKET_JS.replace("__EPISODE_PATH__", '"/viewer/42"').replace("__EPISODE_NO__", "42")
         harness = r"""
@@ -379,7 +687,9 @@ console.log(JSON.stringify([
         results = json.loads(process.stdout)
         self.assertEqual(results[0]["result"]["_t"], "from-SSR")
         self.assertEqual(results[0], results[1])
-        self.assertEqual(results[2:], [None] * 4)
+        self.assertEqual(results[2:4], [None] * 2)
+        self.assertEqual(results[4], {"__pia_viewer_state": "error", "status": 500, "code": ""})
+        self.assertIsNone(results[5])
 
     def test_early_guard_waits_for_root_and_keeps_ad_containers_visible(self):
         script = _SPOILER_GUARD_JS.replace("__EPISODE_PATH__", '"/viewer/42"')

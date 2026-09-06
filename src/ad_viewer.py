@@ -68,6 +68,19 @@ _SSR_TICKET_JS = r"""
             return ticket;
         }
     }
+    for (const ticket of candidates) {
+        if (ticket && ticket.statusCode != null && String(ticket.statusCode) !== '200') {
+            const code = String(ticket.code || '');
+            if (code === '0010' || code === '0008') return {__pia_viewer_state: 'ad'};
+            if (code === '0001' && ticket.result?.name === 'AUTH_ERROR') {
+                return {__pia_viewer_state: 'interactive'};
+            }
+            // Expose only state codes, never account/error messages or URLs.
+            return {__pia_viewer_state: 'error',
+                status: Number(ticket.statusCode) || 0,
+                code: /^\d{1,6}$/.test(code) ? code : ''};
+        }
+    }
     return null;
 })();
 """
@@ -80,6 +93,19 @@ def _viewer_url_matches(url: str, episode_no: int) -> bool:
             parsed.scheme == "https" and parsed.hostname == "global.novelpia.com"
             and parsed.port in (None, 443) and not parsed.username and not parsed.password
             and parsed.path in (f"/viewer/{episode_no}", f"/viewer/{episode_no}/")
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def _authentication_url(url: str) -> bool:
+    try:
+        parsed = urlsplit(url)
+        if parsed.scheme != "https" or parsed.port not in (None, 443) or parsed.username or parsed.password:
+            return False
+        return parsed.hostname == "accounts.google.com" or (
+            parsed.hostname == "global.novelpia.com"
+            and any(part in ("login", "signin", "sign-in", "auth", "oauth") for part in parsed.path.lower().split("/"))
         )
     except (TypeError, ValueError):
         return False
@@ -241,6 +267,7 @@ def install_viewer_handoff(
     on_error: Callable[[], None],
     on_diagnostic: Callable[[str], None] | None = None,
     on_continue: Callable[[], None] | None = None,
+    on_navigation_status: Callable[[str], None] | None = None,
 ) -> None:
     """Prepare a neutral hidden Edge window before loading the real viewer.
 
@@ -254,6 +281,8 @@ def install_viewer_handoff(
     registered = {}
     bridge_token = secrets.token_urlsafe(32)
     continued_clicks = set()
+    navigation = {"visited_viewer": False, "failed": False, "loading": False,
+                  "awaiting_start": False, "id": None}
 
     def diagnostic(message: str) -> None:
         if on_diagnostic is not None:
@@ -272,11 +301,14 @@ def install_viewer_handoff(
             frame = frame.tb_next
         diagnostic(f"{stage} failed ({type(error).__name__}; frames={' > '.join(locations)}).")
 
-    def fail() -> None:
-        if not failed.is_set() and not stopped.is_set():
+    def fail(*, page_load=False) -> None:
+        if not failed.is_set() and not stopped.is_set() and not collector.completed.is_set():
             failed.set()
             stopped.set()
-            on_error()
+            if page_load and on_navigation_status is not None:
+                on_navigation_status("load_error")
+            else:
+                on_error()
 
     def on_closed() -> None:
         stopped.set()
@@ -294,10 +326,13 @@ def install_viewer_handoff(
 
         def on_ui(callback):
             done = threading.Event()
+            abandoned = threading.Event()
             outcome = {}
 
             def execute():
                 try:
+                    if abandoned.is_set():
+                        return
                     if stopped.is_set():
                         raise RuntimeError("Viewer closed")
                     outcome["value"] = callback()
@@ -308,7 +343,10 @@ def install_viewer_handoff(
                     done.set()
 
             native.BeginInvoke(Action(execute))
-            if not done.wait(_SETUP_TIMEOUT) or outcome.get("failed"):
+            if not done.wait(_SETUP_TIMEOUT):
+                abandoned.set()
+                raise RuntimeError("Native viewer setup timed out")
+            if outcome.get("failed"):
                 raise RuntimeError("Native viewer setup failed")
             return outcome.get("value")
 
@@ -323,6 +361,8 @@ def install_viewer_handoff(
                     return
                 page_matches = _viewer_url_matches(str(sender.Source), episode_no)
                 diagnostic(f"Candidate {kind[0]} response: status={status}, viewer_match={page_matches}.")
+                if page_matches and kind[0] == "content" and status >= 400:
+                    navigation["failed"] = True
                 if status != 200 or not page_matches:
                     return
                 # GetContentAsync must start on the GUI thread. Its returned
@@ -397,9 +437,42 @@ def install_viewer_handoff(
                 raise RuntimeError("Edge WebView2 is unavailable")
             core.WebResourceResponseReceived += on_response
             core.WebMessageReceived += on_message
+            def navigation_start(sender, args):
+                if stopped.is_set() or collector.completed.is_set():
+                    return
+                matches = _viewer_url_matches(str(args.Uri), episode_no)
+                navigation["id"] = getattr(args, "NavigationId", None)
+                navigation["loading"] = True
+                navigation["awaiting_start"] = False
+                navigation["failed"] = False
+                diagnostic(f"Viewer navigation started: viewer_match={matches}.")
+
+            def navigation_complete(sender, args):
+                if stopped.is_set() or collector.completed.is_set():
+                    return
+                if navigation["awaiting_start"] or (
+                    navigation["id"] is not None
+                    and getattr(args, "NavigationId", None) != navigation["id"]
+                ):
+                    return
+                navigation["loading"] = False
+                matches = _viewer_url_matches(str(sender.Source), episode_no)
+                success = bool(args.IsSuccess)
+                if matches and success:
+                    navigation["visited_viewer"] = True
+                # Replaced/superseded navigations are ordinary browser events.
+                cancelled = str(args.WebErrorStatus) == "OperationCanceled"
+                if not success and not cancelled:
+                    navigation["failed"] = True
+                diagnostic(f"Viewer navigation finished: viewer_match={matches}, success={success}.")
+
+            core.NavigationStarting += navigation_start
+            core.NavigationCompleted += navigation_complete
             registered["core"] = core
             registered["response_handler"] = on_response
             registered["message_handler"] = on_message
+            registered["navigation_start_handler"] = navigation_start
+            registered["navigation_complete_handler"] = navigation_complete
             # pywebview's normal bridge expects a three-element JSON array.
             # Preserve it for its own messages and keep our native notification
             # objects out of that parser (and its exception logger).
@@ -423,6 +496,18 @@ def install_viewer_handoff(
         registered["script_id"] = _wait_task(task, _SETUP_TIMEOUT, stopped)
         diagnostic("Response observer and document-start guard ready.")
 
+        viewer_url = f"{const.BASE_URL}/viewer/{episode_no}"
+        replace_script = f"window.location.replace({json.dumps(viewer_url)});"
+
+        def replace_viewer():
+            # Do not retain NavigateToString's preparation page in history:
+            # the site's error handler can navigate back after an ad reload.
+            window.real_url = viewer_url
+            navigation["failed"] = False
+            navigation["loading"] = True
+            navigation["awaiting_start"] = True
+            return registered["core"].ExecuteScriptAsync(replace_script)
+
         def navigate():
             from System.Windows.Forms import FormWindowState
 
@@ -432,29 +517,50 @@ def install_viewer_handoff(
             # also calls Activate(). The taskbar can restore it normally.
             native.WindowState = FormWindowState.Minimized
             native.Show()
-            window.load_url(f"{const.BASE_URL}/viewer/{episode_no}")
+            return replace_viewer()
 
-        on_ui(navigate)
+        _wait_task(on_ui(navigate), _SETUP_TIMEOUT, stopped)
 
         def read_hydrated_ticket():
+            from src.ad_navigation import ViewerNavigationWatchdog
+
             seen_tokens = set()
+            watchdog = ViewerNavigationWatchdog(time.monotonic())
+            prior_state = None
             script = (
                 _SSR_TICKET_JS.replace("__EPISODE_PATH__", json.dumps(f"/viewer/{episode_no}"))
                 .replace("__EPISODE_NO__", str(episode_no))
             )
             while not stopped.is_set() and not collector.completed.is_set():
                 try:
+                    body = None
                     def execute():
                         core = registered["core"]
                         if not _viewer_url_matches(str(core.Source), episode_no):
-                            return None
-                        return core.ExecuteScriptAsync(script)
+                            neutral = str(core.Source) in ("", "about:blank")
+                            if navigation["failed"]:
+                                state = "error"
+                            elif _authentication_url(str(core.Source)):
+                                state = "interactive"
+                            else:
+                                state = "neutral" if neutral and navigation["visited_viewer"] and not navigation["loading"] else "loading"
+                            return None, state, navigation["loading"]
+                        return core.ExecuteScriptAsync(script), "error" if navigation["failed"] else "loading", navigation["loading"]
 
-                    task = on_ui(execute)
+                    task, state, loading = on_ui(execute)
                     if task is not None:
                         result = _wait_task(task, _SETUP_TIMEOUT, stopped)
                         body = json.loads(str(result))
                         token = _ticket_token(body, episode_no)
+                        if token is not None:
+                            # A failed content response still needs page recovery;
+                            # a successful ticket alone does not prove delivery.
+                            state = "error" if state == "error" else "ticket"
+                        elif isinstance(body, dict) and state != "error":
+                            marker = body.get("__pia_viewer_state", "loading")
+                            # Until the new navigation finishes, an error can
+                            # still belong to the document being replaced.
+                            state = marker if not loading or marker in ("ad", "interactive") else "loading"
                         if token is not None and token not in seen_tokens:
                             seen_tokens.add(token)
                             # This URL identifies the existing SSR ticket to
@@ -467,9 +573,41 @@ def install_viewer_handoff(
                                 "Read hydrated server ticket: valid=True, "
                                 f"completed={collector.completed.is_set()}."
                             )
+                    if stopped.is_set() or collector.completed.is_set():
+                        return
+                    if state != prior_state:
+                        diagnostic(f"Viewer state: {state}.")
+                        if isinstance(body, dict) and body.get("__pia_viewer_state") == "error":
+                            status_code = str(body.get("status", ""))
+                            error_code = str(body.get("code", ""))
+                            status_code = status_code if re.fullmatch(r"\d{3}", status_code) else "unknown"
+                            error_code = error_code if re.fullmatch(r"\d{1,6}", error_code) else "unknown"
+                            diagnostic(f"Viewer server status: {status_code}, code={error_code}.")
+                        prior_state = state
+                    action = watchdog.observe(state, time.monotonic())
+                    if action == "failed":
+                        diagnostic("Viewer page failed after bounded navigation retries.")
+                        fail(page_load=True)
+                        return
+                    if action == "retry":
+                        diagnostic("Retrying official viewer after a page loading failure.")
+                        if on_navigation_status is not None:
+                            on_navigation_status("retrying")
+                        _wait_task(on_ui(replace_viewer), _SETUP_TIMEOUT, stopped)
                 except Exception as exc:
                     if not stopped.is_set() and not collector.completed.is_set():
                         diagnostic_error("Reading hydrated server ticket", exc)
+                        action = watchdog.observe("error", time.monotonic())
+                        if action == "failed":
+                            fail(page_load=True)
+                            return
+                        if action == "retry":
+                            try:
+                                if on_navigation_status is not None:
+                                    on_navigation_status("retrying")
+                                _wait_task(on_ui(replace_viewer), _SETUP_TIMEOUT, stopped)
+                            except Exception as retry_error:
+                                diagnostic_error("Retrying viewer navigation", retry_error)
                 if stopped.wait(0.5):
                     return
 
