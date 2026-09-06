@@ -46,8 +46,10 @@ class EpisodeAdvertisementTests(unittest.TestCase):
         client = NovelpiaClient(throttle=0)
         unlocked = response(200, "", {"_t": "episode-ticket"})
 
-        def watch(episode_no, *, probe, cancelled, is_unlocked):
+        def watch(episode_no, *, probe, cancelled, is_unlocked, max_retries, retry_cooldown):
             self.assertEqual(episode_no, 670403)
+            self.assertEqual(max_retries, 10)
+            self.assertEqual(retry_cooldown, 5.0)
             self.assertIs(cancelled, cancel_event)
             self.assertFalse(is_unlocked(response()))
             self.assertTrue(is_unlocked(unlocked))
@@ -65,6 +67,31 @@ class EpisodeAdvertisementTests(unittest.TestCase):
         with patch.object(client, "_episode_ticket_response", return_value=unlocked), patch("src.api.watch_episode_ad") as browser:
             client.episode_ticket(670403)
         browser.assert_not_called()
+
+    def test_each_client_passes_its_own_ad_retry_settings(self):
+        for attempts, cooldown in ((0, 0), (4, 12.5), (10, 30)):
+            with self.subTest(attempts=attempts, cooldown=cooldown):
+                client = NovelpiaClient(throttle=0, ad_retries=attempts, ad_retry_cooldown=cooldown)
+                captured = self._captured_episode(675194)
+                with (
+                    patch.object(client, "_episode_ticket_response", return_value=response()),
+                    patch("src.api.watch_episode_ad", return_value=captured) as browser,
+                ):
+                    result = client.episode_ticket(675194)
+                self.assertEqual(browser.call_args.kwargs["max_retries"], attempts)
+                self.assertEqual(browser.call_args.kwargs["retry_cooldown"], cooldown)
+                self.assertEqual(result["_viewer_content"], captured.content)
+
+    def test_invalid_ad_retry_settings_fail_before_creating_session(self):
+        for settings in (
+            {"ad_retries": -1}, {"ad_retries": 2.5}, {"ad_retries": True},
+            {"ad_retry_cooldown": -1}, {"ad_retry_cooldown": float("nan")},
+            {"ad_retry_cooldown": float("inf")},
+        ):
+            with self.subTest(settings=settings), patch("src.api.requests.Session") as session:
+                with self.assertRaises(ValueError):
+                    NovelpiaClient(**settings)
+                session.assert_not_called()
 
     def test_ad_logs_explain_auto_continue_and_confirm_received_chapter(self):
         client = NovelpiaClient(throttle=0)
@@ -237,7 +264,7 @@ class EpisodeAdvertisementTests(unittest.TestCase):
                 return response(200, "", {"_t": f"ticket-{episode_no}"})
             return response()
 
-        def watch(episode_no, *, probe, cancelled, is_unlocked):
+        def watch(episode_no, *, probe, cancelled, is_unlocked, max_retries, retry_cooldown):
             nonlocal active, peak_active
             with state_lock:
                 active += 1

@@ -10,6 +10,9 @@ from typing import Callable
 from urllib.parse import parse_qs, urlsplit
 
 from src import const
+from src.ad_navigation import (
+    DEFAULT_AD_RETRIES, DEFAULT_AD_RETRY_COOLDOWN, validate_ad_retry_settings,
+)
 
 
 _SETUP_TIMEOUT = 20.0
@@ -268,6 +271,9 @@ def install_viewer_handoff(
     on_diagnostic: Callable[[str], None] | None = None,
     on_continue: Callable[[], None] | None = None,
     on_navigation_status: Callable[[str], None] | None = None,
+    *,
+    max_retries: int = DEFAULT_AD_RETRIES,
+    retry_cooldown: float = DEFAULT_AD_RETRY_COOLDOWN,
 ) -> None:
     """Prepare a neutral hidden Edge window before loading the real viewer.
 
@@ -275,6 +281,7 @@ def install_viewer_handoff(
     and the document-start registration must finish before showing/navigating.
     The observer only copies successful responses already made by the website.
     """
+    max_retries, retry_cooldown = validate_ad_retry_settings(max_retries, retry_cooldown)
     stopped = threading.Event()
     failed = threading.Event()
     collector = _ResponseHandoff(episode_no, on_complete)
@@ -500,6 +507,8 @@ def install_viewer_handoff(
         replace_script = f"window.location.replace({json.dumps(viewer_url)});"
 
         def replace_viewer():
+            if stopped.is_set() or collector.completed.is_set():
+                return None
             # Do not retain NavigateToString's preparation page in history:
             # the site's error handler can navigate back after an ad reload.
             window.real_url = viewer_url
@@ -519,13 +528,17 @@ def install_viewer_handoff(
             native.Show()
             return replace_viewer()
 
-        _wait_task(on_ui(navigate), _SETUP_TIMEOUT, stopped)
+        navigation_task = on_ui(navigate)
+        if navigation_task is not None:
+            _wait_task(navigation_task, _SETUP_TIMEOUT, stopped)
 
         def read_hydrated_ticket():
             from src.ad_navigation import ViewerNavigationWatchdog
 
             seen_tokens = set()
-            watchdog = ViewerNavigationWatchdog(time.monotonic())
+            watchdog = ViewerNavigationWatchdog(
+                time.monotonic(), max_retries=max_retries, retry_delay=retry_cooldown,
+            )
             prior_state = None
             script = (
                 _SSR_TICKET_JS.replace("__EPISODE_PATH__", json.dumps(f"/viewer/{episode_no}"))
@@ -593,7 +606,9 @@ def install_viewer_handoff(
                         diagnostic("Retrying official viewer after a page loading failure.")
                         if on_navigation_status is not None:
                             on_navigation_status("retrying")
-                        _wait_task(on_ui(replace_viewer), _SETUP_TIMEOUT, stopped)
+                        navigation_task = on_ui(replace_viewer)
+                        if navigation_task is not None:
+                            _wait_task(navigation_task, _SETUP_TIMEOUT, stopped)
                 except Exception as exc:
                     if not stopped.is_set() and not collector.completed.is_set():
                         diagnostic_error("Reading hydrated server ticket", exc)
@@ -605,7 +620,9 @@ def install_viewer_handoff(
                             try:
                                 if on_navigation_status is not None:
                                     on_navigation_status("retrying")
-                                _wait_task(on_ui(replace_viewer), _SETUP_TIMEOUT, stopped)
+                                navigation_task = on_ui(replace_viewer)
+                                if navigation_task is not None:
+                                    _wait_task(navigation_task, _SETUP_TIMEOUT, stopped)
                             except Exception as retry_error:
                                 diagnostic_error("Retrying viewer navigation", retry_error)
                 if stopped.wait(0.5):

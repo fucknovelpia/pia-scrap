@@ -112,7 +112,7 @@ class AdvertisementTests(unittest.TestCase):
 
     def complete_on_open(self, payload, after=()):
         def publish(command):
-            action, gate_id, _episode_no = command
+            action, gate_id, _episode_no = command[:3]
             if action == "open":
                 self.statuses.put(("complete", gate_id, payload))
                 for status in after:
@@ -203,6 +203,114 @@ class AdvertisementTests(unittest.TestCase):
         probe.assert_called_once_with()
         self.assert_browser_cleaned_up()
 
+    def test_ten_actual_retries_can_complete_after_the_old_five_minute_limit(self):
+        gate = {}
+        retries = 0
+        self.commands.on_put = lambda command: gate.update(id=command[1]) if command[0] == "open" else None
+
+        def progress(_seconds):
+            nonlocal retries
+            self.advance(10)
+            elapsed = self.clock - 100
+            if retries < 10 and elapsed >= 40 * (retries + 1):
+                self.statuses.put(("retrying", gate["id"]))
+                retries += 1
+            if elapsed >= 410:
+                self.statuses.put(("complete", gate["id"], handoff()))
+
+        self.cancelled.wait.side_effect = progress
+        probe = Mock(return_value=ticket())
+        with patch("builtins.print") as output:
+            result = self.watch(probe)
+        self.assertIsInstance(result, AdvertisementResult)
+        self.assertEqual(retries, 10)
+        self.assertEqual(output.call_count, 10)
+        self.assertIn("attempt 10/10; cooldown 5s", output.call_args.args[0])
+        self.assertGreater(self.clock - 100, 300)
+        probe.assert_called_once_with()
+        self.assert_browser_cleaned_up()
+
+    def test_long_cooldown_allows_ad_time_before_the_first_actual_retry(self):
+        gate = {}
+        self.commands.on_put = lambda command: gate.update(id=command[1]) if command[0] == "open" else None
+
+        def progress(_seconds):
+            self.advance(10)
+            elapsed = self.clock - 100
+            # The ad finishes at 60s, then a server error waits the selected
+            # 600s cooldown. A max(300, cooldown + 30) budget would expire.
+            if elapsed == 60:
+                self.statuses.put(("continued", gate["id"]))
+            if elapsed == 660:
+                self.statuses.put(("retrying", gate["id"]))
+            if elapsed == 700:
+                self.statuses.put(("complete", gate["id"], handoff()))
+
+        self.cancelled.wait.side_effect = progress
+        with patch("builtins.print") as output:
+            result = self.watch(Mock(return_value=ticket()), retry_cooldown=600)
+        self.assertIsInstance(result, AdvertisementResult)
+        self.assertEqual(self.clock - 100, 700)
+        self.assertIn("attempt 1/10; cooldown 600s", output.call_args.args[0])
+        self.assert_browser_cleaned_up()
+
+    def test_ready_and_continue_events_do_not_renew_the_attempt_deadline(self):
+        gate = {}
+        self.commands.on_put = lambda command: gate.update(id=command[1]) if command[0] == "open" else None
+
+        def progress(_seconds):
+            self.advance(10)
+            self.statuses.put(("ready", gate["id"]))
+            self.statuses.put(("continued", gate["id"]))
+            if self.clock > 500:
+                self.cancelled.set()  # Bound the test if progress renews it.
+
+        self.cancelled.wait.side_effect = progress
+        with patch("builtins.print"), self.assertRaisesRegex(AdvertisementError, "335 seconds for this attempt"):
+            self.watch(Mock(return_value=ticket()))
+        self.assertLessEqual(self.clock - 100, 340)
+        self.assert_browser_cleaned_up()
+
+    def test_extra_retry_statuses_cannot_extend_beyond_the_configured_budget(self):
+        gate = {}
+        self.commands.on_put = lambda command: gate.update(id=command[1]) if command[0] == "open" else None
+
+        def progress(seconds):
+            self.advance(seconds)
+            self.statuses.put(("retrying", gate["id"]))
+            if self.clock > 105:
+                self.cancelled.set()
+
+        self.cancelled.wait.side_effect = progress
+        with patch("builtins.print") as output, self.assertRaisesRegex(AdvertisementError, "1 seconds for this attempt"):
+            self.watch(Mock(return_value=ticket()), timeout=1, max_retries=1)
+        self.assertAlmostEqual(self.clock, 101.2)
+        output.assert_called_once()
+        self.assertIn("attempt 1/1", output.call_args.args[0])
+        self.assert_browser_cleaned_up()
+
+    def test_cancel_interrupts_a_long_retry_cooldown_immediately(self):
+        def cancel(seconds):
+            self.advance(seconds)
+            self.cancelled.set()
+
+        self.cancelled.wait.side_effect = cancel
+        with self.assertRaisesRegex(AdvertisementError, "cancelled"):
+            self.watch(Mock(return_value=ticket()), max_retries=10, retry_cooldown=600)
+        self.assertLessEqual(self.clock - 100, 0.21)
+        self.assert_browser_cleaned_up()
+
+    def test_invalid_settings_are_rejected_before_probe_or_browser_start(self):
+        probe = Mock()
+        for settings in (
+            {"max_retries": True}, {"max_retries": "2.5"},
+            {"max_retries": -1}, {"retry_cooldown": "NaN"},
+        ):
+            with self.subTest(settings=settings), self.assertRaises(ValueError):
+                self.watch(probe, **settings)
+        probe.assert_not_called()
+        self.get_context.assert_not_called()
+
     def test_failed_initial_probe_still_allows_valid_browser_handoff(self):
         payload = handoff()
         self.complete_on_open(payload)
@@ -229,13 +337,20 @@ class AdvertisementTests(unittest.TestCase):
         self.assert_browser_cleaned_up()
 
     def test_four_gates_share_host_but_keep_window_status_and_cleanup_independent(self):
-        registrations = [_register_viewer(670403 + i, self.cancelled) for i in range(4)]
+        settings = [(0, 0), (3, 7.5), (10, 5), (4, 600)]
+        registrations = [
+            _register_viewer(670403 + i, self.cancelled, max_retries=retries, retry_cooldown=cooldown)
+            for i, (retries, cooldown) in enumerate(settings)
+        ]
         host = registrations[0][0]
         self.assertTrue(all(item[0] is host for item in registrations))
         self.context.Process.assert_called_once()
         opens = [self.commands.get_nowait() for _ in registrations]
         self.assertEqual([entry[0] for entry in opens], ["open"] * 4)
         self.assertEqual([entry[2] for entry in opens], list(range(670403, 670407)))
+        self.assertEqual([entry[3] for entry in opens], [
+            {"max_retries": retries, "retry_cooldown": cooldown} for retries, cooldown in settings
+        ])
         self.assertEqual(len(set(entry[1] for entry in opens)), 4)
         first = registrations[0][1]
         second = registrations[1][1]
@@ -361,11 +476,12 @@ class AdvertisementTests(unittest.TestCase):
         probe = Mock(return_value=ticket())
         with patch("builtins.print") as output:
             with self.assertRaisesRegex(AdvertisementError, "could not load this chapter after automatic retries"):
-                self.watch(probe)
+                self.watch(probe, max_retries=2, retry_cooldown=12.5)
         self.assertEqual(self.clock, 100)
         probe.assert_called_once_with()
         output.assert_called_once_with(
-            "[ad] Episode 670403: Viewer page failed to load; retrying automatically (attempt 2/2).", flush=True,
+            "[ad] Episode 670403: Viewer page failed to load; retrying automatically "
+            "(attempt 2/2; cooldown 12.5s).", flush=True,
         )
         self.assert_browser_cleaned_up()
 
@@ -421,7 +537,8 @@ class AdvertisementViewerTests(unittest.TestCase):
         for window in (anchor, first, second):
             window.events = SimpleNamespace(closed=BrowserEvent(), loaded=BrowserEvent())
         pending = iter([
-            ("open", "first", 670403), ("open", "second", 670404),
+            ("open", "first", 670403, {"max_retries": 0, "retry_cooldown": 0}),
+            ("open", "second", 670404, {"max_retries": 7, "retry_cooldown": 12.5}),
             ("close", "first", None),
         ])
 
@@ -464,6 +581,12 @@ class AdvertisementViewerTests(unittest.TestCase):
             self.assertTrue((Path(directory) / ".webview_data").is_dir())
             self.assertEqual(monitor.call_count, 2)
             self.assertTrue(all(call.kwargs["daemon"] for call in monitor.call_args_list))
+            for call in monitor.call_args_list:
+                call.kwargs["target"]()
+            self.assertEqual([
+                (call.args[1], call.kwargs["max_retries"], call.kwargs["retry_cooldown"])
+                for call in self.install_handoff.call_args_list
+            ], [(670403, 0, 0.0), (670404, 7, 12.5)])
         first.destroy.assert_called_once_with()
         second.destroy.assert_called_once_with()
         anchor.destroy.assert_called_once_with()
@@ -479,9 +602,10 @@ class AdvertisementViewerTests(unittest.TestCase):
         payload = handoff()
         step = 0
 
-        def install(window, episode_no, on_complete, on_error, on_diagnostic=None, on_continue=None, on_navigation_status=None):
+        def install(window, episode_no, on_complete, on_error, on_diagnostic=None, on_continue=None, on_navigation_status=None, **settings):
             self.assertIs(window, viewer)
             self.assertEqual(episode_no, 670403)
+            self.assertEqual(settings, {"max_retries": 10, "retry_cooldown": 5.0})
             on_continue()
             on_complete(payload)
             completed.set()

@@ -1,6 +1,6 @@
 # pia-scrap
 
-Current version: **1.3.1**
+Current version: **1.3.2**
 
 Novelpia downloader with:
 - EPUB export
@@ -135,9 +135,14 @@ receives the chapter directly from the viewer's successful server responses,
 closes the window, and resumes. Chapter text and titles stay hidden in ad windows
 to prevent spoilers. The live log reports the automatic Continue click and each
 completed advertisement. Viewer page failures are automatically retried up to
-twice, without restarting a
-healthy ad countdown. The temporary preparation page is removed from browser
-history, so a failed post-ad navigation cannot return to it and stall.
+10 times by default, with a 5-second cooldown and without restarting a healthy
+ad countdown. Change **Ad retries** and **Retry cooldown (s)** in the Download
+tab and click **Save Settings** to keep these values for future runs. Setting
+Ad retries to 0 disables automatic viewer retries. The limit counts retries
+after the first page attempt. Each retry gets a fresh timeout, allowing longer
+cooldowns and all configured retries to run. The temporary preparation page is
+removed from browser history, so a failed post-ad navigation cannot return to it
+and stall.
 Each download worker
 can open its own ad window, so **Threads = 4** allows up to four simultaneous ad
 windows sharing the same signed-in browser profile. When a worker finishes its
@@ -186,6 +191,8 @@ Important options:
 - `--start`, `--end`
 - `--max-chapters`
 - `--min-interval`, `--max-interval`
+- `--ad-retries`, `--ad-retry-cooldown` (ad viewer retries and cooldown in seconds;
+  override the saved Download settings, with defaults of 10 retries and 5 seconds)
 - `--throttle` (legacy fixed-delay override)
 - `--fetch-profile`
 - `--novel-links-file`

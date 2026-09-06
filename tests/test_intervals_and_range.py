@@ -1,4 +1,5 @@
 import json
+import io
 import tempfile
 import threading
 import unittest
@@ -7,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import requests
+import main
 
 from src.api import NovelpiaClient, cancel_event
 from src.helper import save_config
@@ -222,7 +224,8 @@ class SettingsPersistenceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / ".api.json"
             with patch("src.helper.CONFIG_PATH", config_path):
-                save_config({"min_interval": 0.5, "max_interval": 2.0})
+                save_config({"min_interval": 0.5, "max_interval": 2.0,
+                             "ad_retries": 14, "ad_retry_cooldown": 2.5})
                 save_config({"login_at": "new-token"})
 
             with open(config_path, encoding="utf-8") as handle:
@@ -230,6 +233,90 @@ class SettingsPersistenceTests(unittest.TestCase):
             self.assertEqual(config["min_interval"], 0.5)
             self.assertEqual(config["max_interval"], 2.0)
             self.assertEqual(config["login_at"], "new-token")
+            self.assertEqual(config["ad_retries"], 14)
+            self.assertEqual(config["ad_retry_cooldown"], 2.5)
+
+
+class AdRetryCliSettingsTests(unittest.TestCase):
+    def test_defaults_saved_values_and_explicit_overrides_reach_client_creation(self):
+        cases = (
+            ({}, [], (10, 5.0)),
+            ({"ad_retries": 14, "ad_retry_cooldown": 2.5}, [], (14, 2.5)),
+            ({"ad_retries": 14, "ad_retry_cooldown": 2.5},
+             ["--ad-retries", "0", "--ad-retry-cooldown", "0"], (0, 0.0)),
+            ({"ad_retries": 14, "ad_retry_cooldown": 2.5}, ["--ad-retries", "3"], (3, 2.5)),
+            ({"ad_retries": "7", "ad_retry_cooldown": "4.5"},
+             ["--ad-retry-cooldown", "8"], (7, 8.0)),
+        )
+        for config, flags, expected in cases:
+            with (
+                self.subTest(config=config, flags=flags),
+                patch("main.sys.argv", ["main.py", "123", *flags]),
+                patch("main.load_config", return_value=config),
+                patch("main.create_authenticated_client") as create_client,
+                patch("main.run_single_build", return_value=("output", "Title", 1)),
+                patch("sys.stdout", new_callable=io.StringIO),
+            ):
+                main.main()
+                args, saved = create_client.call_args.args
+                self.assertEqual((args.ad_retries, args.ad_retry_cooldown), expected)
+                self.assertIs(saved, config)
+
+    def test_invalid_cli_or_saved_retry_values_fail_before_authentication(self):
+        cases = (
+            ({}, ["--ad-retries", "1.5"]),
+            ({}, ["--ad-retries", "-1"]),
+            ({}, ["--ad-retry-cooldown", "nan"]),
+            ({}, ["--ad-retry-cooldown", "inf"]),
+            ({}, ["--ad-retry-cooldown", "-1"]),
+            ({"ad_retries": True}, []),
+            ({"ad_retries": 1.5}, []),
+            ({"ad_retry_cooldown": float("nan")}, []),
+            ({"ad_retry_cooldown": -1}, []),
+        )
+        for config, flags in cases:
+            with (
+                self.subTest(config=config, flags=flags),
+                patch("main.sys.argv", ["main.py", "123", *flags]),
+                patch("main.load_config", return_value=config),
+                patch("main.create_authenticated_client") as create_client,
+                patch("main.scrape_novel_links") as scrape,
+                patch("sys.stderr", new_callable=io.StringIO),
+            ):
+                with self.assertRaises(SystemExit) as failed:
+                    main.main()
+                self.assertEqual(failed.exception.code, 2)
+                create_client.assert_not_called()
+                scrape.assert_not_called()
+
+    def test_old_argument_namespace_and_config_still_get_default_client_settings(self):
+        args = SimpleNamespace(
+            login_at=None, userkey=None, tkey=None, chrome_profile=None,
+            email=None, password=None, proxy=None, throttle=None,
+            min_interval=0.5, max_interval=2.0, threads=1, save_session=False,
+        )
+        with (
+            patch("main.NovelpiaClient") as factory,
+            patch("main.dotenv_values", return_value={}),
+            patch.dict("main.os.environ", {}, clear=True),
+            patch("sys.stdout", new_callable=io.StringIO),
+        ):
+            main.create_authenticated_client(args, {})
+        self.assertEqual(factory.call_args.kwargs["ad_retries"], 10)
+        self.assertEqual(factory.call_args.kwargs["ad_retry_cooldown"], 5.0)
+
+    def test_direct_client_setup_rejects_invalid_settings_before_chrome_import(self):
+        args = SimpleNamespace(chrome_profile="Default", ad_retries=1.5, ad_retry_cooldown=5)
+        with (
+            patch("main.load_chrome_novelpia_session") as chrome,
+            patch("main.NovelpiaClient") as factory,
+            patch("main.dotenv_values") as environment,
+        ):
+            with self.assertRaises(ValueError):
+                main.create_authenticated_client(args, {})
+        chrome.assert_not_called()
+        factory.assert_not_called()
+        environment.assert_not_called()
 
 
 class PastedBatchTests(unittest.TestCase):

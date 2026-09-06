@@ -7,6 +7,9 @@ warnings.filterwarnings("ignore", message="urllib3.*doesn't match a supported ve
 
 from dotenv import dotenv_values
 from src.api import AuthenticationError, NovelpiaClient
+from src.ad_navigation import (
+    DEFAULT_AD_RETRIES, DEFAULT_AD_RETRY_COOLDOWN, validate_ad_retry_settings,
+)
 from src.builder import build_epub, build_txt
 from src.chrome_session import load_chrome_novelpia_session
 from src.helper import load_config, save_config
@@ -115,8 +118,18 @@ def parse_novel_id(value: str) -> int:
         return int(m.group(1))
     raise argparse.ArgumentTypeError(f"Cannot extract novel ID from: {value}")
 
+def resolve_ad_retry_settings(args, cfg):
+    retries = getattr(args, "ad_retries", None)
+    cooldown = getattr(args, "ad_retry_cooldown", None)
+    return validate_ad_retry_settings(
+        cfg.get("ad_retries", DEFAULT_AD_RETRIES) if retries is None else retries,
+        cfg.get("ad_retry_cooldown", DEFAULT_AD_RETRY_COOLDOWN) if cooldown is None else cooldown,
+    )
+
+
 def create_authenticated_client(args, cfg):
     """Select one auth source consistently in Python and the frozen desktop app."""
+    ad_retries, ad_retry_cooldown = resolve_ad_retry_settings(args, cfg)
     # Read the file next to the app on every run. load_dotenv() searches from
     # bundled source paths and caches old credentials in the frozen process.
     environment = dict(dotenv_values(const.APP_DIR / ".env"))
@@ -154,6 +167,7 @@ def create_authenticated_client(args, cfg):
         email=email, password=password, proxy=args.proxy, throttle=args.throttle,
         min_interval=args.min_interval, max_interval=args.max_interval,
         userkey=session.get("userkey"), tkey=session.get("tkey"), threads=args.threads,
+        ad_retries=ad_retries, ad_retry_cooldown=ad_retry_cooldown,
     )
     if use_session:
         print("[auth] Checking browser session...")
@@ -200,6 +214,10 @@ def main():
     ap.add_argument("--max-interval", type=float, default=2.0, help="Maximum random delay between episode requests (default: 2.0s)")
     ap.add_argument("--throttle", type=float, default=None, help="Legacy fixed delay; overrides --min-interval and --max-interval")
     ap.add_argument("--threads", type=int, default=1, help="Number of concurrent download threads (default: 1)")
+    ap.add_argument("--ad-retries", type=int, default=None,
+                    help="Automatic ad page retries (0 disables; saved setting or default: 10)")
+    ap.add_argument("--ad-retry-cooldown", type=float, default=None,
+                    help="Seconds before retrying a failed ad page (saved setting or default: 5)")
     ap.add_argument("--txt", "-txt", action="store_true", help="Output plain .txt files per episode instead of EPUB")
     ap.add_argument("--no-images", action="store_true", help="Skip cover and chapter image downloads")
     ap.add_argument("--novel-links-file", help="Read novel links/IDs from a text file and download them one by one")
@@ -228,6 +246,11 @@ def main():
         ap.error("request intervals cannot be negative")
     if args.min_interval > args.max_interval:
         ap.error("--min-interval cannot be greater than --max-interval")
+    try:
+        # Reject invalid explicit options even when launching the UI or scraper.
+        resolve_ad_retry_settings(args, {})
+    except (TypeError, ValueError) as exc:
+        ap.error(str(exc))
 
     const.HTTP_LOG = bool(args.debug)
 
@@ -235,6 +258,12 @@ def main():
     if args.ui or (not args.novel_id and not args.scrape_novel_links and not args.novel_links_file):
         launch_ui()
         return
+
+    cfg = load_config()
+    try:
+        args.ad_retries, args.ad_retry_cooldown = resolve_ad_retry_settings(args, cfg)
+    except (TypeError, ValueError) as exc:
+        ap.error(str(exc))
 
     if args.scrape_novel_links:
         try:
@@ -257,7 +286,7 @@ def main():
         ap.error("novel_id is required unless you use --scrape-novel-links or --novel-links-file")
 
     try:
-        client = create_authenticated_client(args, load_config())
+        client = create_authenticated_client(args, cfg)
     except AuthenticationError as exc:
         print(f"[error] {exc}")
         sys.exit(1)

@@ -204,14 +204,56 @@ class NativeSetupTests(unittest.TestCase):
         self.sequence.append("register")
         return self.task
 
-    def install(self):
-        install_viewer_handoff(self.window, 42, self.complete, self.error, on_continue=self.continued)
+    def install(self, **settings):
+        install_viewer_handoff(self.window, 42, self.complete, self.error, on_continue=self.continued, **settings)
 
     def message_args(self, message=None, source="https://global.novelpia.com/viewer/42"):
         if message is None:
             message = {"type": "pia-ad-continue", "episode_no": 42,
                        "token": "test-bridge-token", "click_id": "first-click"}
         return SimpleNamespace(Source=source, get_WebMessageAsJson=lambda: json.dumps(message))
+
+    def test_configured_retries_and_cooldown_reach_the_native_watchdog(self):
+        constructed = threading.Event()
+        captured = {}
+
+        def watchdog(_now, **settings):
+            captured.update(settings)
+            constructed.set()
+            return SimpleNamespace(observe=lambda state, now: None)
+
+        with patch("src.ad_navigation.ViewerNavigationWatchdog", side_effect=watchdog):
+            self.install(max_retries="7", retry_cooldown="12.5")
+            self.assertTrue(constructed.wait(1))
+        self.assertEqual(captured, {"max_retries": 7, "retry_delay": 12.5})
+        self.error.assert_not_called()
+
+    def test_completed_response_between_retry_decision_and_ui_dispatch_prevents_reload(self):
+        collector = _ResponseHandoff(42, self.complete)
+        dispatch_finished = threading.Event()
+
+        def complete_during_retry(status):
+            self.assertEqual(status, "retrying")
+            collector.receive(API + "?episode_no=42", 200, ticket())
+            collector.receive(API + "/content?_t=real-token", 200, content())
+
+        def invoke(callback):
+            callback()
+            if collector.completed.is_set():
+                dispatch_finished.set()
+
+        self.window.native.BeginInvoke.side_effect = invoke
+        with (
+            patch("src.ad_viewer._ResponseHandoff", return_value=collector),
+            patch("src.ad_navigation.ViewerNavigationWatchdog", return_value=SimpleNamespace(
+                observe=lambda state, now: "retry",
+            )),
+        ):
+            self.install(on_navigation_status=complete_during_retry)
+            self.assertTrue(dispatch_finished.wait(1))
+        self.complete.assert_called_once()
+        self.assertEqual(self.sequence.count("navigate"), 1)
+        self.error.assert_not_called()
 
     def test_observer_and_document_start_registration_finish_before_navigation(self):
         def await_registration(task, timeout, cancelled):
@@ -399,7 +441,7 @@ class NativeSetupTests(unittest.TestCase):
 
         self.read_script.side_effect = read_ad
         self.core.ExecuteScriptAsync.side_effect = navigate
-        with patch("src.ad_navigation.ViewerNavigationWatchdog", side_effect=lambda now: ViewerNavigationWatchdog(now, retry_delay=0)):
+        with patch("src.ad_navigation.ViewerNavigationWatchdog", side_effect=lambda now, **settings: ViewerNavigationWatchdog(now, retry_delay=0)):
             install_viewer_handoff(self.window, 42, self.complete, self.error, on_navigation_status=statuses.append)
             self.assertTrue(first_read.wait(1))
             self.core.NavigationStarting.handlers[0](self.core, SimpleNamespace(
@@ -444,8 +486,9 @@ class NativeSetupTests(unittest.TestCase):
                 finished.set()
 
         self.core.ExecuteScriptAsync.side_effect = fail_navigation
-        with patch("src.ad_navigation.ViewerNavigationWatchdog", side_effect=lambda now: ViewerNavigationWatchdog(now, load_timeout=30, retry_delay=0)):
-            install_viewer_handoff(self.window, 42, self.complete, self.error, on_navigation_status=status)
+        with patch("src.ad_navigation.ViewerNavigationWatchdog", side_effect=lambda now, **settings: ViewerNavigationWatchdog(now, load_timeout=30, **settings)):
+            install_viewer_handoff(self.window, 42, self.complete, self.error, on_navigation_status=status,
+                                   max_retries=2, retry_cooldown=0)
             self.assertTrue(finished.wait(3), "Known native navigation failure used the ordinary load timeout")
         self.assertEqual(statuses, ["retrying", "retrying", "load_error"])
         self.assertEqual(self.sequence.count("navigate"), 3)
@@ -488,7 +531,7 @@ class NativeSetupTests(unittest.TestCase):
             IsCompleted=True, IsFaulted=False, IsCanceled=False,
             Result=json.dumps({"__pia_viewer_state": "ad"}),
         )
-        with patch("src.ad_navigation.ViewerNavigationWatchdog", side_effect=lambda now: RecordingWatchdog(now, retry_delay=0)):
+        with patch("src.ad_navigation.ViewerNavigationWatchdog", side_effect=lambda now, **settings: RecordingWatchdog(now, retry_delay=0)):
             install_viewer_handoff(self.window, 42, self.complete, self.error, diagnostics.append,
                                    on_navigation_status=status)
             self.assertTrue(observed.wait(2))
@@ -509,7 +552,7 @@ class NativeSetupTests(unittest.TestCase):
         retried = threading.Event()
         statuses = []
         watchdog = ViewerNavigationWatchdog(0, load_timeout=30, retry_delay=5)
-        observed_times = iter((0, 6, 29, 30))
+        observed_times = iter((0, 6, 34, 35))
 
         def observe(state, _now):
             instant = next(observed_times)
@@ -540,7 +583,7 @@ class NativeSetupTests(unittest.TestCase):
             self.assertTrue(retried.wait(3))
         self.assertEqual(observations, [
             ("loading", 0, None), ("loading", 6, None),
-            ("loading", 29, None), ("loading", 30, "retry"),
+            ("loading", 34, None), ("loading", 35, "retry"),
         ])
         self.assertEqual(statuses, ["retrying"])
         self.assertEqual(self.sequence.count("navigate"), 2)
@@ -569,7 +612,7 @@ class NativeSetupTests(unittest.TestCase):
                     observed.set()
                 return action
 
-        with patch("src.ad_navigation.ViewerNavigationWatchdog", side_effect=lambda now: RecordingWatchdog(now - 1000, load_timeout=0.001, retry_delay=0)):
+        with patch("src.ad_navigation.ViewerNavigationWatchdog", side_effect=lambda now, **settings: RecordingWatchdog(now - 1000, load_timeout=0.001, retry_delay=0)):
             install_viewer_handoff(self.window, 42, self.complete, self.error, on_navigation_status=status)
             self.assertTrue(observed.wait(2))
         self.assertEqual(states, ["interactive"] * len(login_urls))
@@ -594,7 +637,7 @@ class NativeSetupTests(unittest.TestCase):
                                    Result=json.dumps({"__pia_viewer_state": "ad"}))
 
         self.read_script.side_effect = read_ad
-        with patch("src.ad_navigation.ViewerNavigationWatchdog", side_effect=lambda now: ViewerNavigationWatchdog(now - 1000, load_timeout=0.001, retry_delay=0)):
+        with patch("src.ad_navigation.ViewerNavigationWatchdog", side_effect=lambda now, **settings: ViewerNavigationWatchdog(now - 1000, load_timeout=0.001, retry_delay=0)):
             install_viewer_handoff(self.window, 42, self.complete, self.error, on_navigation_status=status)
             self.assertTrue(observed.wait(2))
         status.assert_not_called()

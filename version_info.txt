@@ -1,8 +1,8 @@
 # UTF-8
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(1, 3, 1, 0),
-    prodvers=(1, 3, 1, 0),
+    filevers=(1, 3, 2, 0),
+    prodvers=(1, 3, 2, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -17,11 +17,11 @@ VSVersionInfo(
         [
           StringStruct(u'CompanyName', u'PIA Scrap contributors'),
           StringStruct(u'FileDescription', u'PIA Scrap Novelpia downloader'),
-          StringStruct(u'FileVersion', u'1.3.1.0'),
+          StringStruct(u'FileVersion', u'1.3.2.0'),
           StringStruct(u'InternalName', u'PIA-Scrap'),
           StringStruct(u'OriginalFilename', u'PIA-Scrap.exe'),
           StringStruct(u'ProductName', u'PIA Scrap'),
-          StringStruct(u'ProductVersion', u'1.3.1')
+          StringStruct(u'ProductVersion', u'1.3.2')
         ]
       )
     ]),

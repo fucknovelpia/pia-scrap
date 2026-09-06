@@ -20,6 +20,9 @@ from dotenv import dotenv_values
 
 
 from src import __version__
+from src.ad_navigation import (
+    DEFAULT_AD_RETRIES, DEFAULT_AD_RETRY_COOLDOWN, validate_ad_retry_settings,
+)
 from src.chrome_session import find_chrome_binary, list_chrome_profiles, load_chrome_novelpia_session
 from src.const import APP_DIR
 from src.helper import load_config, save_config
@@ -185,6 +188,22 @@ def launch_ui() -> None:
     max_interval_var = tk.DoubleVar(
         value=config_number("max_interval", max(2.0, configured_min_interval))
     )
+    try:
+        saved_ad_retries, _ = validate_ad_retry_settings(
+            cfg.get("ad_retries", DEFAULT_AD_RETRIES), DEFAULT_AD_RETRY_COOLDOWN,
+        )
+    except (TypeError, ValueError):
+        saved_ad_retries = DEFAULT_AD_RETRIES
+    try:
+        _, saved_ad_cooldown = validate_ad_retry_settings(
+            DEFAULT_AD_RETRIES, cfg.get("ad_retry_cooldown", DEFAULT_AD_RETRY_COOLDOWN),
+        )
+    except (TypeError, ValueError):
+        saved_ad_cooldown = DEFAULT_AD_RETRY_COOLDOWN
+    # String variables retain typed fractions so retries cannot be silently
+    # truncated by Tk's IntVar conversion before validation.
+    ad_retries_var = tk.StringVar(value=str(saved_ad_retries))
+    ad_retry_cooldown_var = tk.StringVar(value=str(saved_ad_cooldown))
     start_chapter_var = tk.IntVar(value=int(config_number("start_chapter", 0)))
     end_chapter_var = tk.IntVar(value=int(config_number("end_chapter", 0)))
     scrape_out_var = tk.StringVar(value="output/novel_links.txt")
@@ -358,6 +377,13 @@ def launch_ui() -> None:
 
     def read_download_controls():
         try:
+            ad_retries, ad_retry_cooldown = validate_ad_retry_settings(
+                ad_retries_var.get(), ad_retry_cooldown_var.get(),
+            )
+        except (tk.TclError, TypeError, ValueError) as exc:
+            messagebox.showerror("Ad retry settings", str(exc))
+            return None
+        try:
             start_chapter = int(start_chapter_var.get())
             end_chapter = int(end_chapter_var.get())
             min_interval = float(min_interval_var.get())
@@ -388,6 +414,8 @@ def launch_ui() -> None:
             "min_interval": min_interval,
             "max_interval": max_interval,
             "threads": threads,
+            "ad_retries": ad_retries,
+            "ad_retry_cooldown": ad_retry_cooldown,
         }
 
     def save_session_to_config() -> None:
@@ -400,6 +428,8 @@ def launch_ui() -> None:
                 "userkey": userkey_var.get().strip(),
                 "tkey": tkey_var.get().strip(),
                 "threads": settings["threads"],
+                "ad_retries": settings["ad_retries"],
+                "ad_retry_cooldown": settings["ad_retry_cooldown"],
                 "min_interval": settings["min_interval"],
                 "max_interval": settings["max_interval"],
                 "start_chapter": settings["start_chapter"],
@@ -600,6 +630,8 @@ def launch_ui() -> None:
             "userkey": userkey_var.get().strip(),
             "tkey": tkey_var.get().strip(),
             "threads": settings["threads"],
+            "ad_retries": settings["ad_retries"],
+            "ad_retry_cooldown": settings["ad_retry_cooldown"],
             "min_interval": settings["min_interval"],
             "max_interval": settings["max_interval"],
             "start_chapter": settings["start_chapter"],
@@ -625,6 +657,8 @@ def launch_ui() -> None:
             "--threads", str(settings["threads"]),
             "--min-interval", str(settings["min_interval"]),
             "--max-interval", str(settings["max_interval"]),
+            "--ad-retries", str(settings["ad_retries"]),
+            "--ad-retry-cooldown", str(settings["ad_retry_cooldown"]),
         ]
 
         mode = "TXT" if txt_var.get() else "EPUB"
@@ -665,6 +699,8 @@ def launch_ui() -> None:
             "userkey": userkey_var.get().strip(),
             "tkey": tkey_var.get().strip(),
             "threads": settings["threads"],
+            "ad_retries": settings["ad_retries"],
+            "ad_retry_cooldown": settings["ad_retry_cooldown"],
             "min_interval": settings["min_interval"],
             "max_interval": settings["max_interval"],
             "start_chapter": settings["start_chapter"],
@@ -690,6 +726,8 @@ def launch_ui() -> None:
             "--threads", str(settings["threads"]),
             "--min-interval", str(settings["min_interval"]),
             "--max-interval", str(settings["max_interval"]),
+            "--ad-retries", str(settings["ad_retries"]),
+            "--ad-retry-cooldown", str(settings["ad_retry_cooldown"]),
         ]
 
         mode = "TXT" if txt_var.get() else "EPUB"
@@ -1135,12 +1173,37 @@ def launch_ui() -> None:
         justify="left",
     ).grid(row=2, column=2, sticky="w", padx=(18, 0), pady=6)
 
+    ttk.Label(options_section, text="Ad retries", width=18).grid(
+        row=3, column=0, sticky="w", padx=(0, 12), pady=6,
+    )
+    ad_retries_spinbox = ttk.Spinbox(
+        options_section, from_=0, to=100, increment=1,
+        textvariable=ad_retries_var, width=7,
+    )
+    ad_retries_spinbox.grid(row=3, column=1, sticky="w", pady=6)
+    ttk.Label(options_section, text="0 disables automatic ad page retries").grid(
+        row=3, column=2, sticky="w", padx=(18, 0), pady=6,
+    )
+    ttk.Label(options_section, text="Retry cooldown (s)", width=18).grid(
+        row=4, column=0, sticky="w", padx=(0, 12), pady=6,
+    )
+    ad_retry_cooldown_spinbox = ttk.Spinbox(
+        options_section, from_=0.0, to=3600.0, increment=0.5,
+        textvariable=ad_retry_cooldown_var, width=7, format="%.1f",
+    )
+    ad_retry_cooldown_spinbox.grid(row=4, column=1, sticky="w", pady=6)
+    ttk.Label(options_section, text="Wait before retrying a failed ad page").grid(
+        row=4, column=2, sticky="w", padx=(18, 0), pady=6,
+    )
+
     for spinbox in (
         start_chapter_spinbox,
         end_chapter_spinbox,
         threads_spinbox,
         min_interval_spinbox,
         max_interval_spinbox,
+        ad_retries_spinbox,
+        ad_retry_cooldown_spinbox,
     ):
         lock_spinbox_mouse_wheel(spinbox)
 

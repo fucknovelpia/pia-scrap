@@ -13,6 +13,9 @@ from src.helper import j, mask_kv, merge_login_at, save_config
 from src.helper import extract_t_token
 from src.novel import html_from_episode_text
 from src.advertisements import AdvertisementError, AdvertisementResult, watch_episode_ad
+from src.ad_navigation import (
+    DEFAULT_AD_RETRIES, DEFAULT_AD_RETRY_COOLDOWN, validate_ad_retry_settings,
+)
 
 # ----------------------------
 # API Client
@@ -65,7 +68,12 @@ class NovelpiaClient:
                  proxy: Optional[str] = None, timeout: int = 30, throttle: Optional[float] = None,
                  userkey: Optional[str] = None, tkey: Optional[str] = None,
                  threads: int = 1, min_interval: Optional[float] = None,
-                 max_interval: Optional[float] = None):
+                 max_interval: Optional[float] = None,
+                 ad_retries: int = DEFAULT_AD_RETRIES,
+                 ad_retry_cooldown: float = DEFAULT_AD_RETRY_COOLDOWN):
+        self.ad_retries, self.ad_retry_cooldown = validate_ad_retry_settings(
+            ad_retries, ad_retry_cooldown,
+        )
         self.s = requests.Session()
         self.s.headers.update(const.SESSION_HEADERS.copy())
         if proxy:
@@ -296,6 +304,8 @@ class NovelpiaClient:
                 probe=lambda: self._episode_ticket_response(episode_no, max_retries=1),
                 cancelled=cancel_event,
                 is_unlocked=_has_episode_ticket,
+                max_retries=self.ad_retries,
+                retry_cooldown=self.ad_retry_cooldown,
             )
             if isinstance(r, AdvertisementResult):
                 print(f"[ad] Episode {episode_no}: Advertisement complete. Chapter received; resuming download.", flush=True)

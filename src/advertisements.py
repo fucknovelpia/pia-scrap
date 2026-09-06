@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import multiprocessing
+import math
 import queue
 import threading
 import time
@@ -12,6 +13,10 @@ from typing import Callable
 import requests
 
 from src import const
+from src.ad_navigation import (
+    DEFAULT_AD_RETRIES, DEFAULT_AD_RETRY_COOLDOWN, DEFAULT_AD_LOAD_TIMEOUT,
+    validate_ad_retry_settings,
+)
 
 
 class AdvertisementError(RuntimeError):
@@ -99,10 +104,15 @@ def _run_ad_host(stop, commands, statuses) -> None:
             except Exception:
                 pass
 
-        def open_viewer(gate_id: str, episode_no: int) -> None:
+        def open_viewer(
+            gate_id: str, episode_no: int, *,
+            max_retries: int = DEFAULT_AD_RETRIES,
+            retry_cooldown: float = DEFAULT_AD_RETRY_COOLDOWN,
+        ) -> None:
             window_closed = threading.Event()
             _log_browser_event(f"Opening episode {episode_no}.")
             try:
+                max_retries, retry_cooldown = validate_ad_retry_settings(max_retries, retry_cooldown)
                 window = webview.create_window(
                     f"Novelpia -- Advertisement for episode {episode_no}",
                     html="<html><body>Preparing advertisement...</body></html>",
@@ -155,6 +165,7 @@ def _run_ad_host(stop, commands, statuses) -> None:
                             lambda message: _log_browser_event(f"Episode {episode_no}: {message}"),
                             on_continue=on_continue,
                             on_navigation_status=on_navigation_status,
+                            max_retries=max_retries, retry_cooldown=retry_cooldown,
                         )
                     except Exception:
                         on_error()
@@ -188,9 +199,9 @@ def _run_ad_host(stop, commands, statuses) -> None:
                         command = None
                     if command:
                         operation = "dispatching window command"
-                        action, gate_id, episode_no = command
+                        action, gate_id, episode_no, *options = command
                         if action == "open":
-                            open_viewer(gate_id, episode_no)
+                            open_viewer(gate_id, episode_no, **(options[0] if options else {}))
                         elif action == "close":
                             _log_browser_event("Closing completed or cancelled viewer.")
                             with windows_lock:
@@ -314,8 +325,13 @@ class _AdvertisementHost:
                 _close_queue(self.statuses)
 
 
-def _register_viewer(episode_no: int, cancelled: threading.Event):
+def _register_viewer(
+    episode_no: int, cancelled: threading.Event, *,
+    max_retries: int = DEFAULT_AD_RETRIES,
+    retry_cooldown: float = DEFAULT_AD_RETRY_COOLDOWN,
+):
     global _VIEWER_HOST
+    max_retries, retry_cooldown = validate_ad_retry_settings(max_retries, retry_cooldown)
     while not _HOST_LOCK.acquire(timeout=0.2):
         if cancelled.is_set():
             raise AdvertisementError("Advertisement viewing was cancelled.")
@@ -329,7 +345,9 @@ def _register_viewer(episode_no: int, cancelled: threading.Event):
         host.gates[gate_id] = "opening"
         host.continue_counts[gate_id] = 0
         host.recovery_counts[gate_id] = 0
-        host.commands.put(("open", gate_id, episode_no))
+        host.commands.put(("open", gate_id, episode_no, {
+            "max_retries": max_retries, "retry_cooldown": retry_cooldown,
+        }))
         return host, gate_id
     finally:
         _HOST_LOCK.release()
@@ -357,18 +375,31 @@ def watch_episode_ad(
     cancelled: threading.Event,
     is_unlocked: Callable[[requests.Response], bool],
     *,
-    timeout: float = 300.0,
+    timeout: float | None = None,
     poll_interval: float = 0.2,
+    max_retries: int = DEFAULT_AD_RETRIES,
+    retry_cooldown: float = DEFAULT_AD_RETRY_COOLDOWN,
 ) -> requests.Response | AdvertisementResult:
     """Return a pre-existing ticket or the official viewer's authorized content.
 
     A loaded page, elapsed ad timer or closed window never proves completion.
     Once a viewer opens, it owns the ticket/content requests. Polling for another
     ticket races its one-use unlock and can hang after the chapter has loaded.
+
+    Each attempt allows 300 seconds for the ad, plus the configured cooldown and
+    page-load allowance. Only a new bounded retry renews that budget;
+    page loads and Continue clicks cannot keep a stuck attempt alive. An explicit
+    ``timeout`` overrides the per-attempt allowance for callers needing a shorter
+    bound. The maximum number of attempt budgets is ``max_retries + 1``.
     """
     if not isinstance(episode_no, int) or isinstance(episode_no, bool) or episode_no <= 0:
         raise ValueError("Episode number must be a positive integer.")
-    if timeout <= 0 or poll_interval <= 0:
+    max_retries, retry_cooldown = validate_ad_retry_settings(max_retries, retry_cooldown)
+    attempt_timeout = 300.0 + retry_cooldown + DEFAULT_AD_LOAD_TIMEOUT if timeout is None else timeout
+    if (
+        not math.isfinite(attempt_timeout) or attempt_timeout <= 0
+        or not math.isfinite(poll_interval) or poll_interval <= 0
+    ):
         raise ValueError("Advertisement timeout and polling interval must be positive.")
 
     def check_cancelled() -> None:
@@ -390,9 +421,11 @@ def watch_episode_ad(
     response = unlocked_ticket()
     if response is not None:
         return response
-    host, gate_id = _register_viewer(episode_no, cancelled)
+    host, gate_id = _register_viewer(
+        episode_no, cancelled, max_retries=max_retries, retry_cooldown=retry_cooldown,
+    )
     try:
-        deadline = time.monotonic() + timeout
+        deadline = time.monotonic() + attempt_timeout
         reported_continues = 0
         reported_recoveries = 0
         while True:
@@ -406,8 +439,17 @@ def watch_episode_ad(
                 print(f"[ad] Episode {episode_no}: Continue auto-clicked. Waiting for chapter...", flush=True)
                 reported_continues = continue_count
             if recovery_count > reported_recoveries:
-                print(f"[ad] Episode {episode_no}: Viewer page failed to load; retrying automatically (attempt {recovery_count}/2).", flush=True)
-                reported_recoveries = recovery_count
+                # The child emits this only when it actually attempts another
+                # navigation. Cap extensions even if an invalid extra status
+                # arrives; ordinary progress never renews the attempt budget.
+                bounded_count = min(recovery_count, max_retries)
+                if bounded_count > reported_recoveries:
+                    deadline = time.monotonic() + attempt_timeout
+                    print(
+                        f"[ad] Episode {episode_no}: Viewer page failed to load; retrying automatically "
+                        f"(attempt {bounded_count}/{max_retries}; cooldown {retry_cooldown:g}s).", flush=True,
+                    )
+                reported_recoveries = bounded_count
             if status == "complete":
                 from src.ad_viewer import validate_handoff
                 if not validate_handoff(payload, episode_no):
@@ -436,7 +478,7 @@ def watch_episode_ad(
             if remaining <= 0:
                 raise AdvertisementError(
                     "The advertisement viewer did not deliver the chapter within "
-                    f"{timeout:g} seconds. In the viewer, sign in to the same "
+                    f"{attempt_timeout:g} seconds for this attempt. In the viewer, sign in to the same "
                     "account and allow the advertisement to finish, then retry."
                 )
             cancelled.wait(min(poll_interval, 0.2, remaining))
