@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import multiprocessing
 import os
@@ -19,15 +20,78 @@ from dotenv import dotenv_values
 
 
 from src import __version__
-from src.chrome_session import list_chrome_profiles, load_chrome_novelpia_session
+from src.chrome_session import find_chrome_binary, list_chrome_profiles, load_chrome_novelpia_session
 from src.const import APP_DIR
 from src.helper import load_config, save_config
 
-CHROME_BINARY = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 ENV_PATH = APP_DIR / ".env"
 LOG_DIR = APP_DIR / "output" / "logs"
 TEMP_BATCH_PREFIX = "pia-scrap-batch-"
 NOVEL_PATH_RE = re.compile(r"/novel/(\d+)", re.IGNORECASE)
+AUTH_ARGUMENTS = {"--user", "--pass", "--login-at", "--userkey", "--tkey"}
+
+
+class QueueWriter(io.TextIOBase):
+    """Stream the full log while retaining bounded recent output for the result dialog."""
+
+    RECENT_OUTPUT_LIMIT = 65536
+
+    def __init__(self, queue, logf):
+        self._queue = queue
+        self._logf = logf
+        self.recent_output = ""
+
+    def write(self, text):
+        if text:
+            self.recent_output = (self.recent_output + text)[-self.RECENT_OUTPUT_LIMIT:]
+            self._queue.put(text)
+            self._logf.write(text)
+            self._logf.flush()
+        return len(text) if text else 0
+
+    def flush(self):
+        pass
+
+
+def build_auth_args(
+    email: str, password: str, login_at: str, userkey: str, tkey: str,
+) -> list[str]:
+    """Use a captured browser session before saved email/password credentials."""
+    login_at, userkey, tkey = login_at.strip(), userkey.strip(), tkey.strip()
+    if login_at or userkey or tkey:
+        values = (("--login-at", login_at), ("--userkey", userkey), ("--tkey", tkey))
+    else:
+        values = (("--user", email.strip()), ("--pass", password))
+    return [part for flag, value in values if value for part in (flag, value)]
+
+
+def redact_auth_args(args: list[str]) -> list[str]:
+    """Keep authentication values out of both the live and saved command logs."""
+    redacted: list[str] = []
+    redact_next = False
+    for arg in args:
+        if redact_next:
+            redacted.append("[REDACTED]")
+            redact_next = False
+        elif arg in AUTH_ARGUMENTS:
+            redacted.append(arg)
+            redact_next = True
+        elif arg.split("=", 1)[0] in AUTH_ARGUMENTS and "=" in arg:
+            redacted.append(arg.split("=", 1)[0] + "=[REDACTED]")
+        else:
+            redacted.append(arg)
+    return redacted
+
+
+def read_webview_login_result(path: Path) -> dict | None:
+    """Return any completed login result, including cancellation or an error."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return {"status": "error", "error": "The login browser returned an invalid result."}
+    return data
 
 
 def parse_pasted_novel_entries(text: str) -> list[str]:
@@ -136,6 +200,9 @@ def launch_ui() -> None:
     was_cancelled = False
     cancel_event = threading.Event()
     log_attention_generation = 0
+    login_process = None
+    login_result_path: Path | None = None
+    login_poll_id: str | None = None
 
     def set_status(text: str) -> None:
         status_var.set(text)
@@ -149,6 +216,7 @@ def launch_ui() -> None:
         import_btn.config(state=state)
         login_btn.config(state=state)
         login_import_btn.config(state=state)
+        google_login_btn.config(state=("disabled" if is_busy or login_process else "normal"))
         save_btn.config(state=state)
         save_env_btn.config(state=state)
         download_settings_btn.config(state=state)
@@ -231,19 +299,16 @@ def launch_ui() -> None:
             return
 
         login_key_var.set(session.login_key or "")
-        if session.login_at:
-            login_at_var.set(session.login_at)
-        if session.userkey:
-            userkey_var.set(session.userkey)
-        if session.tkey:
-            tkey_var.set(session.tkey)
+        login_at_var.set(session.login_at or "")
+        userkey_var.set(session.userkey or "")
+        tkey_var.set(session.tkey or "")
 
         set_status(f"Imported Novelpia cookies from Chrome profile '{profile}'.")
-        if not session.login_key:
+        if not (session.login_at or session.userkey or session.tkey):
             messagebox.showwarning(
                 "Chrome",
-                "Chrome cookies were imported, but LOGINKEY was not found.\n"
-                "You may still need to paste a valid login-at token manually.",
+                "No usable Novelpia session was found in this Chrome profile.\n"
+                "Log in first, then import again, or use Login with Google.",
             )
 
     def open_chrome_login(auto_import: bool = False) -> None:
@@ -252,16 +317,16 @@ def launch_ui() -> None:
             messagebox.showerror("Chrome", "No Chrome profile selected.")
             return
 
-        chrome_path = Path(CHROME_BINARY)
-        if not chrome_path.exists():
-            messagebox.showerror("Chrome", f"Chrome binary not found at:\n\n{CHROME_BINARY}")
+        chrome_binary = find_chrome_binary()
+        if not chrome_binary:
+            messagebox.showerror("Chrome", "Google Chrome could not be found on this computer.")
             return
 
         try:
             auto_import_after_login.set(auto_import)
             subprocess.Popen(
                 [
-                    CHROME_BINARY,
+                    chrome_binary,
                     f"--profile-directory={profile}",
                     "--new-window",
                     "https://global.novelpia.com/login",
@@ -384,24 +449,8 @@ def launch_ui() -> None:
 
                 if getattr(sys, 'frozen', False):
                     # Frozen exe: run main() in-process with stdout redirected
-                    import io
-
-                    class QueueWriter(io.TextIOBase):
-                        """Redirect stdout/stderr to the UI log queue and log file."""
-                        def __init__(self, queue, logf):
-                            self._queue = queue
-                            self._logf = logf
-                        def write(self, s):
-                            if s:
-                                self._queue.put(s)
-                                self._logf.write(s)
-                                self._logf.flush()
-                            return len(s) if s else 0
-                        def flush(self):
-                            pass
-
                     with current_log_path.open("w", encoding="utf-8") as logf:
-                        logf.write(f"$ PIA-Scrap.exe {' '.join(args)}\n\n")
+                        logf.write(f"$ PIA-Scrap.exe {' '.join(redact_auth_args(args))}\n\n")
                         writer = QueueWriter(log_queue, logf)
                         old_stdout, old_stderr = sys.stdout, sys.stderr
                         old_argv = sys.argv
@@ -414,12 +463,14 @@ def launch_ui() -> None:
                             sys.argv = ["PIA-Scrap.exe", *args]
                             from main import main as _main
                             _main()
-                            root.after(0, lambda: finish_run(0, "", success_message))
+                            root.after(0, lambda output=writer.recent_output: finish_run(0, output, success_message))
                         except SystemExit as e:
-                            code = e.code if isinstance(e.code, int) else 1
-                            root.after(0, lambda: finish_run(code, "", success_message))
+                            code = 0 if e.code is None else e.code if isinstance(e.code, int) else 1
+                            if e.code is not None and not isinstance(e.code, int):
+                                writer.write(f"[error] {e.code}\n")
+                            root.after(0, lambda code=code, output=writer.recent_output: finish_run(code, output, success_message))
                         except KeyboardInterrupt:
-                            root.after(0, lambda: finish_run(1, "", success_message))
+                            root.after(0, lambda output=writer.recent_output: finish_run(1, output, success_message))
                         except Exception as e:
                             import traceback
                             err = traceback.format_exc()
@@ -453,7 +504,7 @@ def launch_ui() -> None:
                     output_parts: list[str] = []
                     assert proc.stdout is not None
                     with current_log_path.open("w", encoding="utf-8") as logf:
-                        logf.write(f"$ {' '.join(cmd)}\n\n")
+                        logf.write(f"$ {' '.join(redact_auth_args(cmd))}\n\n")
                         for raw_line in proc.stdout:
                             line = raw_line.replace("\r", "\n")
                             output_parts.append(line)
@@ -484,7 +535,7 @@ def launch_ui() -> None:
         set_status(running_message)
         clear_log()
         animate_live_log_attention()
-        cmd_display = f"python main.py {' '.join(args)}"
+        cmd_display = f"python main.py {' '.join(redact_auth_args(args))}"
         append_log(f"$ {cmd_display}\n\n")
         threading.Thread(target=worker, daemon=True).start()
         return True
@@ -558,16 +609,10 @@ def launch_ui() -> None:
         })
 
         args = [novel_id, "--out", out_var.get().strip() or "output"]
-        if email_var.get().strip():
-            args += ["--user", email_var.get().strip()]
-        if password_var.get().strip():
-            args += ["--pass", password_var.get().strip()]
-        if login_at_var.get().strip():
-            args += ["--login-at", login_at_var.get().strip()]
-        if userkey_var.get().strip():
-            args += ["--userkey", userkey_var.get().strip()]
-        if tkey_var.get().strip():
-            args += ["--tkey", tkey_var.get().strip()]
+        args += build_auth_args(
+            email_var.get(), password_var.get(), login_at_var.get(),
+            userkey_var.get(), tkey_var.get(),
+        )
         if txt_var.get():
             args.append("--txt")
         if not download_images_var.get():
@@ -629,16 +674,10 @@ def launch_ui() -> None:
         })
         links_file = links_file_override or batch_links_var.get().strip() or "output/novel_links.txt"
         args = ["--novel-links-file", links_file, "--out", out_var.get().strip() or "output"]
-        if email_var.get().strip():
-            args += ["--user", email_var.get().strip()]
-        if password_var.get().strip():
-            args += ["--pass", password_var.get().strip()]
-        if login_at_var.get().strip():
-            args += ["--login-at", login_at_var.get().strip()]
-        if userkey_var.get().strip():
-            args += ["--userkey", userkey_var.get().strip()]
-        if tkey_var.get().strip():
-            args += ["--tkey", tkey_var.get().strip()]
+        args += build_auth_args(
+            email_var.get(), password_var.get(), login_at_var.get(),
+            userkey_var.get(), tkey_var.get(),
+        )
         if txt_var.get():
             args.append("--txt")
         if not download_images_var.get():
@@ -806,69 +845,115 @@ def launch_ui() -> None:
     ttk.Separator(creds_tab).grid(row=3, column=0, columnspan=3, sticky="ew", pady=(4, 12))
 
     # --- Login with Google (webview) ---
+    def cleanup_google_login() -> None:
+        nonlocal login_process, login_result_path, login_poll_id
+        if login_poll_id is not None:
+            root.after_cancel(login_poll_id)
+            login_poll_id = None
+        proc, login_process = login_process, None
+        if proc is not None:
+            try:
+                if proc.is_alive():
+                    proc.terminate()
+                proc.join(timeout=1)
+                if not proc.is_alive():
+                    proc.close()
+            except (OSError, ValueError, AssertionError):
+                pass
+        if login_result_path is not None:
+            try:
+                login_result_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            login_result_path = None
+        google_login_btn.config(state=("disabled" if busy_var.get() else "normal"))
+
+    def finish_google_login(data: dict) -> None:
+        """Apply the child result on Tk's main thread, then release its resources."""
+        cleanup_google_login()
+        login_at = data.get("login_at")
+        if isinstance(login_at, str) and login_at.strip():
+            login_at = login_at.strip()
+            userkey = data.get("userkey") or ""
+            tkey = data.get("tkey") or ""
+            userkey = userkey.strip() if isinstance(userkey, str) else ""
+            tkey = tkey.strip() if isinstance(tkey, str) else ""
+            login_at_var.set(login_at)
+            userkey_var.set(userkey)
+            tkey_var.set(tkey)
+            login_key_var.set("")
+            try:
+                save_config({"login_at": login_at, "userkey": userkey, "tkey": tkey})
+            except Exception as exc:
+                set_status("Google login: session captured, but could not be saved.")
+                messagebox.showwarning(
+                    "Session not saved",
+                    f"You can download using this session, but it could not be saved:\n\n{exc}",
+                )
+            else:
+                set_status("Google login: session captured and saved successfully.")
+            append_log("[auth] Google login: session captured; downloads will use this session.\n")
+            return
+
+        if data.get("status") == "cancelled":
+            message = "Login browser closed before a session was captured."
+        else:
+            message = str(data.get("error") or "Login browser closed without detecting a session. Please try again.")
+        set_status(f"Google login: {message}")
+        append_log(f"[auth] {message}\n")
+        if data.get("status") != "cancelled":
+            messagebox.showerror("Google Login", message)
+
     def google_login() -> None:
         """Launch embedded webview for Google OAuth login."""
-        from src.webview_login import _run_webview_login
-
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".loginkey", mode="w") as tmp:
-            key_path = tmp.name
-
-        def poll_result():
-            for _ in range(900):
-                try:
-                    if os.path.exists(key_path) and os.path.getsize(key_path) > 2:
-                        with open(key_path, "r", encoding="utf-8") as f:
-                            data = json.load(f)
-                        login_at = (data.get("login_at") or "").strip()
-                        userkey = (data.get("userkey") or "").strip()
-                        tkey = (data.get("tkey") or "").strip()
-                        if login_at:
-                            login_at_var.set(login_at)
-                            if userkey:
-                                userkey_var.set(userkey)
-                            if tkey:
-                                tkey_var.set(tkey)
-                            set_status("Google login: session captured successfully.")
-                            append_log("[auth] Google login: login-at token captured.\n")
-                            save_config({
-                                "login_at": login_at,
-                                "userkey": userkey,
-                                "tkey": tkey,
-                            })
-                            try:
-                                os.remove(key_path)
-                            except Exception:
-                                pass
-                            return
-                except Exception:
-                    pass
-                time.sleep(1)
-            set_status("Google login: session not captured (timed out).")
-            append_log("[auth] Google login: timed out waiting for token.\n")
-
-        try:
-            import webview
-            if not hasattr(webview, 'create_window'):
-                raise ImportError("wrong webview module")
-        except Exception as _wv_err:
-            messagebox.showerror(
-                "Missing Dependency",
-                f"pywebview could not be loaded:\n\n{_wv_err}\n\n"
-                "Run: pip install pywebview pythonnet"
-            )
+        nonlocal login_process, login_result_path, login_poll_id
+        if login_process is not None or busy_var.get():
             return
 
         try:
-            proc = multiprocessing.Process(target=_run_webview_login, args=(key_path,), daemon=True)
-            proc.start()
-            append_log(f"[auth] Webview process started (PID: {proc.pid}).\n")
+            from src.webview_login import _run_webview_login
+
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".loginkey", mode="w") as tmp:
+                login_result_path = Path(tmp.name)
+            login_process = multiprocessing.get_context("spawn").Process(
+                target=_run_webview_login, args=(str(login_result_path),), daemon=True,
+            )
+            login_process.start()
         except Exception as e:
+            cleanup_google_login()
             messagebox.showerror("Google Login Failed", f"Could not start webview process:\n\n{e}")
             return
 
+        deadline = time.monotonic() + 900
+
+        def poll_result() -> None:
+            nonlocal login_poll_id
+            login_poll_id = None
+            if login_process is None or login_result_path is None:
+                return
+            data = read_webview_login_result(login_result_path)
+            if data is not None:
+                finish_google_login(data)
+                return
+            if not login_process.is_alive():
+                # The child may have published its result between the read and exit check.
+                data = read_webview_login_result(login_result_path)
+                finish_google_login(data if data is not None else {
+                    "status": "error",
+                    "error": "The login browser exited before detecting a session. Please try again.",
+                })
+                return
+            if time.monotonic() >= deadline:
+                finish_google_login({
+                    "status": "timeout", "error": "Login was not completed within 15 minutes.",
+                })
+                return
+            login_poll_id = root.after(250, poll_result)
+
+        google_login_btn.config(state="disabled")
         set_status("Google login: browser opened. Log in with your Google account...")
         append_log("[auth] Opening Novelpia Global login browser...\n")
-        threading.Thread(target=poll_result, daemon=True).start()
+        login_poll_id = root.after(250, poll_result)
 
     google_login_btn = ttk.Button(creds_tab, text="Login with Google", command=google_login)
     google_login_btn.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(0, 12))
@@ -903,7 +988,7 @@ def launch_ui() -> None:
 
     ttk.Label(
         creds_tab,
-        text="Email/password are used first. Google login or imported browser session is optional.",
+        text="A captured or imported browser session is used first. Clear the session fields to use email/password.",
         wraplength=760,
         justify="left",
     ).grid(row=13, column=0, columnspan=3, sticky="w", pady=(12, 0))
@@ -1118,6 +1203,7 @@ def launch_ui() -> None:
 
     def on_close():
         """Clean shutdown: cancel any running work, then force-exit."""
+        cleanup_google_login()
         cancel_event.set()
         try:
             from src.api import cancel_event as api_cancel

@@ -5,8 +5,8 @@ import sys
 import warnings
 warnings.filterwarnings("ignore", message="urllib3.*doesn't match a supported version")
 
-from dotenv import load_dotenv
-from src.api import NovelpiaClient
+from dotenv import dotenv_values
+from src.api import AuthenticationError, NovelpiaClient
 from src.builder import build_epub, build_txt
 from src.chrome_session import load_chrome_novelpia_session
 from src.helper import load_config, save_config
@@ -115,14 +115,75 @@ def parse_novel_id(value: str) -> int:
         return int(m.group(1))
     raise argparse.ArgumentTypeError(f"Cannot extract novel ID from: {value}")
 
+def create_authenticated_client(args, cfg):
+    """Select one auth source consistently in Python and the frozen desktop app."""
+    # Read the file next to the app on every run. load_dotenv() searches from
+    # bundled source paths and caches old credentials in the frozen process.
+    environment = dict(dotenv_values(const.APP_DIR / ".env"))
+    environment.update(os.environ)
+    explicit_session = any((args.login_at, args.userkey, args.tkey, args.chrome_profile))
+    explicit_credentials = bool(args.email or args.password)
+    if args.chrome_profile:
+        try:
+            imported = load_chrome_novelpia_session(args.chrome_profile)
+        except Exception as exc:
+            raise AuthenticationError(f"Failed to import Chrome session: {exc}") from exc
+        session = {"login_at": imported.login_at, "userkey": imported.userkey, "tkey": imported.tkey}
+        if not any(session.values()):
+            raise AuthenticationError("No Novelpia session was found in this Chrome profile. Sign in first.")
+    elif explicit_session:
+        session = {}
+    elif explicit_credentials:
+        session = {}
+    elif any(environment.get(key) for key in ("NOVELPIA_LOGIN_AT", "NOVELPIA_USERKEY", "NOVELPIA_TKEY")):
+        session = {key: environment.get("NOVELPIA_" + key.upper()) for key in ("login_at", "userkey", "tkey")}
+    else:
+        session = {key: cfg.get(key) for key in ("login_at", "userkey", "tkey")}
+    if explicit_session:
+        for key in ("login_at", "userkey", "tkey"):
+            if getattr(args, key):
+                session[key] = getattr(args, key)
+    session = {key: str(value).strip() if value else None for key, value in session.items()}
+    use_session = any(session.values())
+    # Credentials from a different provider must never replace a browser login.
+    email = None if use_session else (args.email or environment.get("NOVELPIA_EMAIL"))
+    password = None if use_session else (args.password or environment.get("NOVELPIA_PASSWORD"))
+    if not use_session and bool(email) != bool(password):
+        raise AuthenticationError("Email/password login requires both an email and a password.")
+    client = NovelpiaClient(
+        email=email, password=password, proxy=args.proxy, throttle=args.throttle,
+        min_interval=args.min_interval, max_interval=args.max_interval,
+        userkey=session.get("userkey"), tkey=session.get("tkey"), threads=args.threads,
+    )
+    if use_session:
+        print("[auth] Checking browser session...")
+        client.tokens.login_at = session.get("login_at")
+        if not client.tokens.login_at:
+            client.refresh()
+        client.me()
+        print("[auth] Browser session recognized.")
+    elif email and password:
+        print("[auth] Signing in with email/password...")
+        client.login()
+        print("[auth] Email/password login successful.")
+    else:
+        print("[info] No credentials found. Running without login (free chapters only).")
+    if (email and password) or (use_session and args.save_session):
+        save_config({
+            "login_at": client.tokens.login_at or "",
+            "userkey": client.tokens.userkey or "",
+            "tkey": client.tokens.tkey or "",
+        })
+    return client
+
+
 def main():
-    load_dotenv()
     ap = argparse.ArgumentParser(description="Novelpia to EPUB packer (API)")
     ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     ap.add_argument("novel_id", type=parse_novel_id, nargs="?", help="Novel ID or URL (e.g., 1072 or https://global.novelpia.com/novel/1072)")
     ap.add_argument("--ui", action="store_true", help="Launch the desktop UI")
-    ap.add_argument("--user", "--email", "-u", "-e", dest="email", help="Novelpia email (overrides config tokens if provided)")
-    ap.add_argument("--pass", "--password", "-p", dest="password", help="Novelpia password (overrides config tokens if provided)")
+    ap.add_argument("--user", "--email", "-u", "-e", dest="email", help="Novelpia email (used when no explicit browser session is supplied)")
+    ap.add_argument("--pass", "--password", "-p", dest="password", help="Novelpia password (used when no explicit browser session is supplied)")
     ap.add_argument("--login-at", dest="login_at", help="Existing Novelpia session token from your browser/app session")
     ap.add_argument("--userkey", dest="userkey", help="Existing USERKEY cookie from your browser/app session")
     ap.add_argument("--tkey", dest="tkey", help="Existing TKEY cookie from your browser/app session")
@@ -195,101 +256,11 @@ def main():
     if args.novel_id is None and not args.novel_links_file:
         ap.error("novel_id is required unless you use --scrape-novel-links or --novel-links-file")
 
-    cfg = load_config()
-    cfg_login_at = (cfg.get("login_at") or "").strip() or None
-    cfg_userkey = (cfg.get("userkey") or "").strip() or None
-    cfg_tkey = (cfg.get("tkey") or "").strip() or None
-
-    # Priority: CLI > .env > config tokens > error
-    email = args.email or os.getenv("NOVELPIA_EMAIL")
-    password = args.password or os.getenv("NOVELPIA_PASSWORD")
-    chrome_session = None
-    if args.chrome_profile:
-        try:
-            chrome_session = load_chrome_novelpia_session(args.chrome_profile)
-        except Exception as e:
-            print(f"[error] Failed to import Chrome session: {e}")
-            sys.exit(1)
-
-    session_login_at = (
-        args.login_at
-        or os.getenv("NOVELPIA_LOGIN_AT")
-        or (chrome_session.login_at if chrome_session else None)
-        or cfg_login_at
-    )
-    session_userkey = (
-        args.userkey
-        or os.getenv("NOVELPIA_USERKEY")
-        or (chrome_session.userkey if chrome_session else None)
-        or cfg_userkey
-    )
-    session_tkey = (
-        args.tkey
-        or os.getenv("NOVELPIA_TKEY")
-        or (chrome_session.tkey if chrome_session else None)
-        or cfg_tkey
-    )
-
-    if email and password:
-        client = NovelpiaClient(
-            email=email,
-            password=password,
-            proxy=args.proxy,
-            throttle=args.throttle,
-            min_interval=args.min_interval,
-            max_interval=args.max_interval,
-            userkey=session_userkey,
-            tkey=session_tkey,
-            threads=args.threads,
-        )
-        client.login()
-        # Persist/refresh tokens after successful login
-        userkey_val = None
-        tkey_val = None
-        try:
-            for c in client.s.cookies:
-                if c.name == "USERKEY":
-                    userkey_val = c.value
-                elif c.name == "TKEY":
-                    tkey_val = c.value
-        except Exception as e:
-            print(f"Error occurred while fetching cookies: {e}")
-            pass
-        save_config({
-            "login_at": client.tokens.login_at,
-            "userkey": userkey_val or session_userkey or "",
-            "tkey": tkey_val or client.tokens.tkey or session_tkey or "",
-        })
-    elif session_login_at and session_userkey:
-        client = NovelpiaClient(
-            email=None,
-            password=None,
-            proxy=args.proxy,
-            throttle=args.throttle,
-            min_interval=args.min_interval,
-            max_interval=args.max_interval,
-            userkey=session_userkey,
-            tkey=session_tkey,
-            threads=args.threads,
-        )
-        client.tokens.login_at = session_login_at
-        if args.save_session and (args.login_at or args.userkey or args.tkey or args.chrome_profile):
-            save_config({
-                "login_at": session_login_at or "",
-                "userkey": session_userkey or "",
-                "tkey": session_tkey or "",
-            })
-    else:
-        print("[info] No credentials found. Running without login (free chapters only).")
-        client = NovelpiaClient(
-            email=None,
-            password=None,
-            proxy=args.proxy,
-            throttle=args.throttle,
-            min_interval=args.min_interval,
-            max_interval=args.max_interval,
-            threads=args.threads,
-        )
+    try:
+        client = create_authenticated_client(args, load_config())
+    except AuthenticationError as exc:
+        print(f"[error] {exc}")
+        sys.exit(1)
 
     if args.novel_links_file:
         try:

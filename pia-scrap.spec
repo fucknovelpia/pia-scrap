@@ -11,6 +11,7 @@ a = Analysis(
     hiddenimports=[
         'src',
         'src.api',
+        'src.advertisements',
         'src.builder',
         'src.chrome_session',
         'src.const',

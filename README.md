@@ -88,6 +88,17 @@ python3 main.py 49
 
 ### 3. Existing Session
 
+For Google accounts, use **Login with Google** in the desktop app and wait for
+the login window to close automatically. The captured session is saved and used
+for downloads ahead of saved email/password credentials. Clear the session
+fields in the Login tab to switch back to email/password.
+
+Python and the Windows executable use the same authentication flow. Settings
+are read beside `main.py` in source mode or beside `PIA-Scrap.exe` in a build.
+An explicitly supplied browser session takes priority over password flags;
+explicit password flags otherwise override saved sessions. Expired sessions
+are refreshed with their cookies and the new token is used for the retry.
+
 You can reuse session values directly:
 
 ```bash
@@ -106,10 +117,24 @@ Import Novelpia session data from a local Chrome profile:
 python3 main.py --chrome-profile "Default" 49
 ```
 
+Chrome import supports Windows, macOS, and Linux profiles. If Chrome's cookie
+encryption prevents import, use the app's login window instead. Imported
+cookies are refreshed to obtain an access token; `LOGINKEY` is not an access token.
+
 Or do it from the UI with:
 - `Import From Chrome`
 - `Open Chrome Login`
 - `Login In Chrome And Import`
+
+When a chapter requires an advertisement (`0010`), the downloader opens that
+chapter in the official viewer using the app's browser profile. Let the real ad
+finish; the app presses the normal Continue button after the countdown, then
+closes the window and resumes once Novelpia grants access. Each download worker
+can open its own ad window, so **Threads = 4** allows up to four simultaneous ad
+windows sharing the same signed-in browser profile. If the viewer asks you
+to sign in, use the same account as the downloader. Closing an ad before it
+finishes reports that chapter as unavailable without repeatedly refreshing
+login. Cancelling the download also closes its ad windows.
 
 ## CLI Overview
 

@@ -1,236 +1,245 @@
-"""Webview-based Google login for Novelpia Global.
-
-After Google OAuth redirect, calls /v1/login/refresh from the browser
-(which works with session cookies alone) to obtain the LOGINAT JWT.
-"""
+"""Capture a Novelpia session in an embedded browser after any login method."""
 from __future__ import annotations
 
 import json
 import os
+import tempfile
+import threading
 import time
-import traceback
+from urllib.parse import urlsplit
 
 LOGIN_URL = "https://global.novelpia.com/"
+LOGIN_TIMEOUT = 15 * 60
+
+# Each request owns its result object so a delayed response cannot overwrite a
+# later request. Abort before the Python polling deadline if the server hangs.
+FETCH_REFRESH_JS = r"""
+(function() {
+    if (window.location.origin !== 'https://global.novelpia.com') return false;
+    var state = {done: false, status: 0, data: null};
+    window.__pia_refresh_state = state;
+    var controller = new AbortController();
+    var timer = setTimeout(function() { controller.abort(); }, 8000);
+    fetch('https://api-global.novelpia.com/v1/login/refresh', {
+        method: 'GET',
+        credentials: 'include',
+        headers: {'accept': 'application/json'},
+        signal: controller.signal
+    })
+    .then(function(response) {
+        state.status = response.status;
+        return response.json();
+    })
+    .then(function(data) { state.data = data; })
+    .catch(function() { state.failed = true; })
+    .finally(function() { clearTimeout(timer); state.done = true; });
+    return true;
+})();
+"""
+
+
+def _is_login_origin(url: str) -> bool:
+    try:
+        parsed = urlsplit(url)
+        return (
+            parsed.scheme == "https"
+            and parsed.hostname == "global.novelpia.com"
+            and parsed.port in (None, 443)
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def _login_at_from_refresh(state: object) -> str | None:
+    """Accept only a successful refresh, never an error body's apparent token."""
+    if (
+        not isinstance(state, dict)
+        or not state.get("done")
+        or state.get("status") != 200
+        or state.get("failed")
+    ):
+        return None
+    data = state.get("data")
+    if not isinstance(data, dict) or str(data.get("statusCode")) != "200":
+        return None
+    result = data.get("result")
+    if not isinstance(result, dict):
+        return None
+    token = result.get("LOGINAT")
+    return token.strip() if isinstance(token, str) and token.strip() else None
+
+
+def _get_auth_cookies(window) -> dict[str, str]:
+    """Prefer native cookies, which include HttpOnly cookies hidden from JS."""
+    cookies: dict[str, str] = {}
+    try:
+        for part in (window.evaluate_js("document.cookie") or "").split(";"):
+            name, sep, value = part.strip().partition("=")
+            if sep and name in ("USERKEY", "TKEY"):
+                cookies[name] = value
+    except Exception:
+        pass
+    try:
+        # pywebview returns a list of http.cookies.SimpleCookie objects.
+        for cookie in window.get_cookies() or []:
+            for name, morsel in cookie.items():
+                if name in ("USERKEY", "TKEY"):
+                    cookies[name] = morsel.value
+    except Exception:
+        # Older engines may not provide a native cookie API.
+        pass
+    return cookies
+
+
+def _try_refresh_token(window, stopped: threading.Event, debug) -> str | None:
+    try:
+        if stopped.is_set() or not window.evaluate_js(FETCH_REFRESH_JS):
+            return None
+        for _ in range(40):
+            if stopped.wait(0.25):
+                return None
+            state = window.evaluate_js("window.__pia_refresh_state || null")
+            if not isinstance(state, dict):
+                # Navigation clears the previous page's pending request.
+                return None
+            if state.get("done"):
+                token = _login_at_from_refresh(state)
+                if not token:
+                    status = state.get("status")
+                    safe_status = status if isinstance(status, int) else "unknown"
+                    debug(f"Refresh not authenticated (HTTP {safe_status}).")
+                return token
+        debug("Refresh request timed out; will retry.")
+    except Exception as exc:
+        # Exceptions/response bodies can contain tokens or OAuth redirect URLs.
+        debug(f"Refresh unavailable ({type(exc).__name__}); will retry.")
+    return None
+
+
+def _poll_for_login(window, stopped: threading.Event, debug, timeout: float = LOGIN_TIMEOUT) -> dict:
+    deadline = time.monotonic() + timeout
+    while not stopped.is_set() and time.monotonic() < deadline:
+        try:
+            # Do not require observing a Google redirect: email login, popups,
+            # fast redirects and restored sessions can all keep the same URL.
+            if window.events.loaded.is_set() and _is_login_origin(window.get_current_url() or ""):
+                token = _try_refresh_token(window, stopped, debug)
+                if token and not stopped.is_set() and _is_login_origin(window.get_current_url() or ""):
+                    cookies = _get_auth_cookies(window)
+                    if stopped.is_set():
+                        break
+                    debug("Login session captured successfully.")
+                    return {
+                        "status": "success",
+                        "login_at": token,
+                        "userkey": cookies.get("USERKEY", ""),
+                        "tkey": cookies.get("TKEY", ""),
+                    }
+        except Exception as exc:
+            debug(f"Login page unavailable ({type(exc).__name__}); will retry.")
+        stopped.wait(min(3.0, max(0.0, deadline - time.monotonic())))
+    if stopped.is_set():
+        return {"status": "cancelled"}
+    return {"status": "timeout", "error": "Login was not completed within 15 minutes."}
 
 
 def _run_webview_login(output_path: str) -> None:
     from src.const import APP_DIR
+
     log_dir = os.path.join(str(APP_DIR), "output", "logs")
-    os.makedirs(log_dir, exist_ok=True)
     debug_path = os.path.join(log_dir, "webview_debug.log")
 
-    def _dbg(msg: str) -> None:
+    def debug(message: str) -> None:
         try:
-            with open(debug_path, "a", encoding="utf-8") as f:
-                f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+            os.makedirs(log_dir, exist_ok=True)
+            with open(debug_path, "a", encoding="utf-8") as log:
+                log.write(f"[{time.strftime('%H:%M:%S')}] {message}\n")
         except Exception:
             pass
 
-    _dbg("=== webview login started ===")
+    debug("=== webview login started ===")
+    stopped = threading.Event()
+    result_lock = threading.Lock()
+    finished = False
+
+    def finish(data: dict) -> None:
+        nonlocal finished
+        with result_lock:
+            if not finished:
+                _write_result(output_path, data)
+                finished = True
 
     try:
-        from pythonnet import load
-        load()
-    except Exception:
-        pass
-
-    try:
+        try:
+            from pythonnet import load
+            load()
+        except Exception:
+            pass
         import webview
-    except Exception:
-        _dbg(f"webview import FAILED:\n{traceback.format_exc()}")
-        _write_result(output_path, {})
-        return
 
-    # JS: call /v1/login/refresh from the browser with credentials:include.
-    # This endpoint works with session cookies alone and returns the LOGINAT JWT.
-    FETCH_REFRESH_JS = r"""
-    (function() {
-        window.__pia_refresh_result = null;
-        window.__pia_refresh_error = null;
-        window.__pia_refresh_done = false;
+        # OAuth popup links must stay in this browser's cookie storage. The
+        # default sends them to the user's browser, whose session is separate.
+        webview.settings["OPEN_EXTERNAL_LINKS_IN_BROWSER"] = False
 
-        fetch('https://api-global.novelpia.com/v1/login/refresh', {
-            method: 'GET',
-            credentials: 'include',
-            headers: {
-                'accept': 'application/json',
-                'origin': 'https://global.novelpia.com',
-                'referer': 'https://global.novelpia.com/'
-            }
-        })
-        .then(function(r) { return r.text(); })
-        .then(function(text) {
-            window.__pia_refresh_result = text;
-            window.__pia_refresh_done = true;
-        })
-        .catch(function(e) {
-            window.__pia_refresh_error = e.message || String(e);
-            window.__pia_refresh_done = true;
-        });
-    })();
-    """
-
-    def get_cookies_dict() -> dict:
-        cookies = {}
         try:
-            js_str = window.evaluate_js("document.cookie") or ""
-            for part in js_str.split(";"):
-                part = part.strip()
-                if "=" in part:
-                    k, v = part.split("=", 1)
-                    cookies[k.strip()] = v.strip()
+            import ctypes
+            screen_width = ctypes.windll.user32.GetSystemMetrics(0)
+            screen_height = ctypes.windll.user32.GetSystemMetrics(1)
         except Exception:
-            pass
-        return cookies
+            screen_width, screen_height = 1200, 900
 
-    def try_refresh_token() -> str | None:
-        """Call /v1/login/refresh from the browser to get the LOGINAT JWT."""
-        try:
-            window.evaluate_js(FETCH_REFRESH_JS)
-
-            for _ in range(20):
-                time.sleep(0.5)
-                done = window.evaluate_js("window.__pia_refresh_done")
-                if done:
-                    break
-
-            error = window.evaluate_js("window.__pia_refresh_error")
-            if error:
-                _dbg(f"Refresh fetch error: {error}")
-                return None
-
-            raw = window.evaluate_js("window.__pia_refresh_result")
-            if not raw:
-                _dbg("Refresh fetch: no result")
-                return None
-
-            _dbg(f"Refresh response: {raw[:200]}")
-
-            data = json.loads(raw)
-            if str(data.get("statusCode")) != "200":
-                _dbg(f"Refresh failed: {data.get('errmsg')}")
-                return None
-
-            login_at = (data.get("result") or {}).get("LOGINAT")
-            if login_at and isinstance(login_at, str) and len(login_at) > 20:
-                _dbg(f"Got LOGINAT: {login_at[:50]}...")
-                return login_at
-
-            _dbg(f"No LOGINAT in refresh response: {list((data.get('result') or {}).keys())}")
-        except Exception as e:
-            _dbg(f"Refresh error: {e}")
-        return None
-
-    result_holder = {"login_at": None, "userkey": None, "tkey": None}
-    was_on_google = False
-
-    def poll_for_login(_window=None) -> None:
-        nonlocal was_on_google
-        _dbg("poll started...")
-        time.sleep(5)
-
-        # Try immediate refresh — user may already be logged in from a previous session
-        _dbg("Trying immediate refresh (returning user)...")
-        login_at = try_refresh_token()
-        if login_at:
-            cookies = get_cookies_dict()
-            _dbg(f"Returning user SUCCESS! token={login_at[:50]}...")
-            result_holder["login_at"] = login_at
-            result_holder["userkey"] = cookies.get("USERKEY", "")
-            result_holder["tkey"] = cookies.get("TKEY", "")
-            _write_result(output_path, result_holder)
-            try:
-                window.destroy()
-            except Exception:
-                pass
-            return
-
-        _dbg("Not logged in yet, waiting for Google OAuth...")
-
-        for i in range(900):
-            try:
-                cur_url = ""
-                try:
-                    cur_url = window.get_current_url() or ""
-                except Exception:
-                    pass
-
-                if "accounts.google.com" in cur_url:
-                    if not was_on_google:
-                        _dbg(f"poll #{i}: Google OAuth detected")
-                        was_on_google = True
-
-                if was_on_google and "novelpia.com" in cur_url and "accounts.google" not in cur_url:
-                    _dbg(f"poll #{i}: redirect back: {cur_url[:80]}")
-                    was_on_google = False
-
-                    # Wait for sign page to process
-                    _dbg("Waiting 8s for login to complete...")
-                    time.sleep(8)
-
-                    for attempt in range(15):
-                        _dbg(f"Token attempt {attempt+1}/15...")
-                        login_at = try_refresh_token()
-
-                        if login_at:
-                            cookies = get_cookies_dict()
-                            _dbg(f"SUCCESS! LOGINAT={login_at[:50]}...")
-                            result_holder["login_at"] = login_at
-                            result_holder["userkey"] = cookies.get("USERKEY", "")
-                            result_holder["tkey"] = cookies.get("TKEY", "")
-                            _write_result(output_path, result_holder)
-                            try:
-                                window.destroy()
-                            except Exception:
-                                pass
-                            return
-
-                        time.sleep(3)
-
-                    _dbg("All attempts failed")
-
-                if i < 5 or (i % 60 == 0):
-                    _dbg(f"poll #{i}: url={cur_url[:60] if cur_url else None}, google={was_on_google}")
-
-            except Exception as e:
-                if i < 5:
-                    _dbg(f"poll #{i} error: {e}")
-            time.sleep(1)
-
-    # Window sizing
-    try:
-        import ctypes
-        _sw = ctypes.windll.user32.GetSystemMetrics(0)
-        _sh = ctypes.windll.user32.GetSystemMetrics(1)
-    except Exception:
-        _sw, _sh = 1200, 900
-
-    # Persistent storage -- keeps Google login cookies between sessions
-    storage_dir = os.path.join(str(APP_DIR), ".webview_data")
-    os.makedirs(storage_dir, exist_ok=True)
-    _dbg(f"Storage path: {storage_dir}")
-
-    try:
+        storage_dir = os.path.join(str(APP_DIR), ".webview_data")
+        os.makedirs(storage_dir, exist_ok=True)
         window = webview.create_window(
             "Novelpia Global -- Login (wait for auto-close)",
             LOGIN_URL,
-            width=int(_sw * 0.6),
-            height=int(_sh * 0.7),
+            width=int(screen_width * 0.6),
+            height=int(screen_height * 0.7),
         )
-        webview.start(poll_for_login, window, debug=False,
-                      private_mode=False, storage_path=storage_dir)
-    except Exception:
-        _dbg(f"webview FAILED:\n{traceback.format_exc()}")
 
-    if result_holder["login_at"] is None:
-        _write_result(output_path, {})
+        def on_closed() -> None:
+            stopped.set()
 
-    _dbg("=== webview login ended ===")
+        window.events.closed += on_closed
+
+        def poll_for_login() -> None:
+            try:
+                finish(_poll_for_login(window, stopped, debug))
+            finally:
+                if not stopped.is_set():
+                    try:
+                        window.destroy()
+                    except Exception:
+                        pass
+
+        webview.start(poll_for_login, debug=False, private_mode=False, storage_path=storage_dir)
+    except Exception as exc:
+        debug(f"Browser login failed ({type(exc).__name__}).")
+        finish({
+            "status": "error",
+            "error": (
+                "The login browser could not start. Check that pywebview and the "
+                "Microsoft Edge WebView2 Runtime are installed and the application "
+                "folder is writable."
+            ),
+        })
+    finally:
+        stopped.set()
+        finish({"status": "cancelled"})
+        debug("=== webview login ended ===")
 
 
 def _write_result(path: str, data: dict) -> None:
+    """Publish a complete payload; the UI must never read half a JSON object."""
+    temporary_path = None
     try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f)
-    except Exception:
-        pass
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=os.path.dirname(os.path.abspath(path)),
+            suffix=".loginkey", delete=False,
+        ) as result_file:
+            temporary_path = result_file.name
+            json.dump(data, result_file)
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path and os.path.exists(temporary_path):
+            os.remove(temporary_path)

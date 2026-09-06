@@ -1,5 +1,3 @@
-import json
-import os
 import random
 import time
 import threading
@@ -11,9 +9,10 @@ import re as _re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 from src import const
-from src.helper import j, mask_kv, attach_auth_cookies, merge_login_at
+from src.helper import j, mask_kv, merge_login_at, save_config
 from src.helper import extract_t_token
 from src.novel import html_from_episode_text
+from src.advertisements import AdvertisementError, watch_episode_ad
 
 # ----------------------------
 # API Client
@@ -21,6 +20,32 @@ from src.novel import html_from_episode_text
 
 # Module-level cancel event — set by the UI to stop downloads
 cancel_event = threading.Event()
+
+
+class AuthenticationError(RuntimeError):
+    """An authentication failure with a message suitable for the desktop UI."""
+
+
+def _session_token(response: requests.Response, action: str) -> str:
+    try:
+        data = response.json()
+    except ValueError:
+        data = {}
+    result = data.get("result") if isinstance(data, dict) else None
+    token = result.get("LOGINAT") if isinstance(result, dict) else None
+    status = data.get("statusCode", 200) if isinstance(data, dict) else None
+    if response.ok and str(status) == "200" and isinstance(token, str) and token.strip():
+        return token.strip()
+    if action == "login":
+        raise AuthenticationError(
+            f"Novelpia email/password login failed (HTTP {response.status_code}). "
+            "Check your Novelpia credentials, or use Login with Google in the Login tab "
+            "for a Google account, then retry the download."
+        )
+    raise AuthenticationError(
+        f"Novelpia could not refresh the saved session (HTTP {response.status_code}). "
+        "Sign in again using Login with Google, or import fresh browser session cookies."
+    )
 
 @dataclass
 class Tokens:
@@ -113,15 +138,16 @@ class NovelpiaClient:
 
 
     def login(self):
+        if not self.email or not self.password:
+            raise AuthenticationError("No email/password credentials are available. Sign in again in the Login tab.")
+        self.s.cookies.set("last_login", "basic", domain=".novelpia.com", path="/")
         url = f"{const.API_BASE}/v1/member/login"
         r = request_with_retries(
             self.s, "POST", url,
             json={"email": self.email, "passwd": self.password},
             timeout=self.timeout, max_retries=2,
         )
-        r.raise_for_status()
-        data = r.json()
-        self.tokens.login_at = data["result"]["LOGINAT"]
+        self.tokens.login_at = _session_token(r, "login")
         # Capture cookies after successful login
         try:
             for c in self.s.cookies:
@@ -131,35 +157,29 @@ class NovelpiaClient:
                     self.tokens.userkey = c.value
         except Exception:
             pass
+        return self.tokens.login_at
 
     def refresh(self) -> Optional[str]:
         url = f"{const.API_BASE}/v1/login/refresh"
-        # /v1/login/refresh works with session cookies alone (USERKEY).
+        # /v1/login/refresh works with session cookies (including TKEY).
         # Do NOT send login-at header — if the JWT is expired, the API
         # will reject the request even though cookies would succeed.
         r = request_with_retries(
             self.s, "GET", url,
+            headers={"login-at": None},
             timeout=self.timeout, max_retries=2,
         )
-        r.raise_for_status()
-        self.tokens.login_at = r.json()["result"]["LOGINAT"]
-        # Persist refreshed token to config
-        try:
-            cfg: Dict[str, Any] = {}
-            if os.path.exists(const.CONFIG_PATH):
-                try:
-                    with open(const.CONFIG_PATH, "r", encoding="utf-8") as f:
-                        cfg = json.load(f) or {}
-                except Exception as e:
-                    print(f"Error loading config: {e}")
-                    cfg = {}
-            cfg["login_at"] = self.tokens.login_at
-            with open(const.CONFIG_PATH, "w", encoding="utf-8") as f:
-                json.dump(cfg, f, ensure_ascii=False, indent=2)
-                pass
-        except Exception as e:
-            print(f"Error saving config: {e}")
-            pass
+        self.tokens.login_at = _session_token(r, "refresh")
+        for cookie in self.s.cookies:
+            if cookie.name == "USERKEY":
+                self.tokens.userkey = cookie.value
+            elif cookie.name == "TKEY":
+                self.tokens.tkey = cookie.value
+        save_config({
+            "login_at": self.tokens.login_at,
+            "userkey": self.tokens.userkey or "",
+            "tkey": self.tokens.tkey or "",
+        })
         return self.tokens.login_at
 
     def _on_rate_limit(self):
@@ -184,8 +204,13 @@ class NovelpiaClient:
             refresh_fn=self.refresh, login_fn=self.login,
             on_rate_limit=self._on_rate_limit
         )
-        r.raise_for_status()
-        return r.json()
+        if not r.ok or _is_auth_error(r):
+            raise AuthenticationError("The saved Novelpia session is no longer valid. Sign in again in the Login tab.")
+        data = r.json()
+        result = data.get("result") if isinstance(data, dict) else None
+        if not isinstance(result, dict) or not result.get("login"):
+            raise AuthenticationError("Novelpia did not recognize the saved session. Sign in again in the Login tab.")
+        return data
 
     def novel(self, novel_id: int) -> Dict:
         url = f"{const.API_BASE}/v1/novel"
@@ -217,19 +242,34 @@ class NovelpiaClient:
         r.raise_for_status()
         return r.json()
 
-    def episode_ticket(self, episode_no: int) -> Dict:
+    def _episode_ticket_response(self, episode_no: int, *, max_retries: int = 4) -> requests.Response:
         url = f"{const.API_BASE}/v1/novel/episode"
         headers = merge_login_at({}, self.tokens.login_at)
         params = {"episode_no": episode_no}
-        # Randomized pause before the ticket endpoint to avoid rate limits.
-        self._sleep_request_interval()
-        r = request_with_retries(
+        return request_with_retries(
             self.s, "GET", url,
             headers=headers, params=params,
             timeout=self.timeout, allow_refresh=True, 
             refresh_fn=self.refresh, login_fn=self.login,
-            on_rate_limit=self._on_rate_limit, max_retries=4,
+            on_rate_limit=self._on_rate_limit, max_retries=max_retries,
         )
+
+    def episode_ticket(self, episode_no: int) -> Dict:
+        # Randomized pause before the ticket endpoint to avoid rate limits.
+        self._sleep_request_interval()
+        r = self._episode_ticket_response(episode_no)
+        if _is_ad_required(r):
+            print(
+                f"[ad] Episode {episode_no} requires an advertisement. Opening the official viewer; "
+                "allow the ad to finish. If prompted, sign in with the same Novelpia account."
+            )
+            r = watch_episode_ad(
+                episode_no,
+                probe=lambda: self._episode_ticket_response(episode_no, max_retries=1),
+                cancelled=cancel_event,
+                is_unlocked=_has_episode_ticket,
+            )
+            print(f"[ad] Novelpia unlocked episode {episode_no}. Resuming download.")
         if r.status_code >= 400:
             raise requests.HTTPError(describe_http_error(r), response=r)
         return r.json()
@@ -285,6 +325,12 @@ class NovelpiaClient:
         # 1) Ticket
         try:
             tdata = self.episode_ticket(epi_no)
+        except AdvertisementError as e:
+            # A closed/unavailable ad cannot be fixed by rotating credentials.
+            return {
+                "error": str(e), "epi_no": epi_no, "epi_title": epi_title,
+                "idx": idx, "retryable": False,
+            }
         except Exception as e:
             return {"error": str(e), "epi_no": epi_no, "epi_title": epi_title, "idx": idx}
 
@@ -360,7 +406,8 @@ class NovelpiaClient:
             if (not res) or ("error" in res):
                 err = res.get("error") if res else "Unknown error"
                 print(f"[warn] Chapter {idx} failed on first attempt: {err}")
-                res = self._recover_episode(ep, idx)
+                if not res or res.get("retryable", True):
+                    res = self._recover_episode(ep, idx)
             results[idx - 1] = res
             if progress_cb:
                 ok = bool(res) and "error" not in res
@@ -422,9 +469,10 @@ class NovelpiaClient:
                                 raise KeyboardInterrupt("Cancelled by user")
                             err = res.get("error") if res else "Unknown error"
                             print(f"[warn] Chapter {idx} failed: {err}")
-                            self._suppress_request_interval = False
-                            res = self._recover_episode(ep, idx)
-                            self._suppress_request_interval = True
+                            if not res or res.get("retryable", True):
+                                self._suppress_request_interval = False
+                                res = self._recover_episode(ep, idx)
+                                self._suppress_request_interval = True
 
                         results[idx - 1] = res
                         if progress_cb:
@@ -484,6 +532,8 @@ class NovelpiaClient:
                         print(f"[warn] Full re-login failed before retry: {e}")
 
                 retry_res = self.fetch_episode(ep, idx)
+                if retry_res and not retry_res.get("retryable", True):
+                    return retry_res
                 if retry_res and "error" not in retry_res:
                     print(f"[info] Recovered chapter {idx} on recovery attempt {attempt}/{self.recover_attempts}.")
                     return retry_res
@@ -516,148 +566,132 @@ def describe_http_error(resp: requests.Response) -> str:
         return f"{base} | {details}"
     return base
 
+def _is_ad_required(response: requests.Response) -> bool:
+    """The episode API reports ad gates as HTTP 500 / application code 0010."""
+    try:
+        body = response.json()
+    except ValueError:
+        return False
+    if not isinstance(body, dict):
+        return False
+    result = body.get("result")
+    result = result if isinstance(result, dict) else {}
+    code = str(body.get("code") or result.get("code") or "")
+    message = str(body.get("errmsg") or body.get("message") or result.get("message") or "").lower()
+    return code == "0010" or "basic advertisement" in message
+
+
+def _has_episode_ticket(response: requests.Response) -> bool:
+    if not response.ok or _is_ad_required(response):
+        return False
+    try:
+        body = response.json()
+        if not isinstance(body, dict) or str(body.get("statusCode", 200)) != "200":
+            return False
+        if not isinstance(body.get("result"), dict):
+            return False
+        token, url = extract_t_token(body)
+        return bool(token or url)
+    except ValueError:
+        return False
+
+
+def _is_auth_error(response: requests.Response) -> bool:
+    if response.status_code in (401, 403):
+        return True
+    try:
+        body = response.json()
+        if not isinstance(body, dict):
+            return False
+        result = body.get("result")
+        result = result if isinstance(result, dict) else {}
+        message = str(body.get("errmsg") or body.get("message") or result.get("message") or "").lower()
+        return (
+            "logged in" in message or "login" in message
+            or ("token" in message and ("expire" in message or "invalid" in message))
+            or str(body.get("code") or result.get("code")) == "0004"
+        )
+    except ValueError:
+        return False
+
+
 def request_with_retries(session: requests.Session, method: str, url: str, *,
                           headers=None, params=None, json=None, data=None,
                           timeout=30, max_retries=3, backoff=1.25,
                           allow_refresh=False, refresh_fn=None,
                           login_fn=None, on_rate_limit=None):
-    """Generic request wrapper: retries on 5xx, 429, and network issues.
-    If allow_refresh is True and the response indicates an expired token, invoke
-    refresh_fn() followed by login_fn() if needed, then retry.
-    """
-    attempt = 0
-    last_exc = None
+    """Retry transient failures and send the NEW token after auth recovery."""
+    request_headers = dict(headers or {})
     did_refresh = False
     did_login = False
-    while attempt < max_retries:
+    attempt = 0
+    while attempt < max(1, max_retries):
         attempt += 1
         if cancel_event.is_set():
             raise requests.RequestException("Cancelled by user")
         try:
-            # Inject Cookie header (except for login endpoint) using session cookies
-            try:
-                if "/v1/member/login" not in url:
-                    attach_auth_cookies(session, headers)
-            except Exception as e:
-                print(f"Error occurred while attaching auth cookies: {e}")
-                pass
-
+            # Let requests build cookies from the current jar on every attempt.
+            # A manually cached Cookie header would miss cookies rotated by refresh.
             if const.HTTP_LOG:
                 print(f"[api]   -> {method} {url} (attempt {attempt}/{max_retries})")
-                try:
-                    eff_headers = {}
-                    try:
-                        eff_headers.update(getattr(session, "headers", {}) or {})
-                    except Exception as e:
-                        print(f"Error occurred while fetching session headers: {e}")
-                        pass
-                    if headers:
-                        eff_headers.update(headers)
-                except Exception as e:
-                    print(f"[api]   req-headers: <unavailable> ({e})")
                 if params:
                     print(f"[api]   params:  {j(mask_kv(params))}")
                 if json is not None:
                     print(f"[api]   json:    {j(mask_kv(json))}")
+            response = session.request(
+                method, url, headers=request_headers, params=params,
+                json=json, data=data, timeout=timeout,
+            )
+        except requests.RequestException:
+            if attempt >= max_retries:
+                raise
+            time.sleep(backoff ** attempt)
+            continue
 
-            r = session.request(method, url, headers=headers, params=params, json=json, data=data, timeout=timeout)
+        if const.HTTP_LOG and response.status_code != 200:
+            print(f"[api]   <- {response.status_code} {response.reason}")
 
-            if const.HTTP_LOG and r.status_code != 200:
-                print(f"[api]   <- {r.status_code} {r.reason} from {r.url}")
-                print(f"[api]   <- Response content: {r.text}")
-            
-            # Handle rate limiting (429)
-            if r.status_code == 429:
+        # This is an application gate, not a transient server/auth failure.
+        # Return it immediately so episode_ticket can show the advertisement.
+        if url.split("?", 1)[0].rstrip("/").endswith("/v1/novel/episode") and _is_ad_required(response):
+            return response
+
+        auth_error = _is_auth_error(response)
+        if allow_refresh and auth_error:
+            token = None
+            if refresh_fn and not did_refresh:
+                did_refresh = True
+                try:
+                    token = refresh_fn()
+                except (requests.RequestException, AuthenticationError, ValueError, KeyError):
+                    pass
+            if not token and login_fn and not did_login:
+                did_login = True
+                try:
+                    token = login_fn()
+                except (requests.RequestException, AuthenticationError, ValueError, KeyError):
+                    pass
+            if token:
+                # Header names are case insensitive. Remove the expired value
+                # before merging, including values supplied as Login-At.
+                request_headers = {
+                    key: value for key, value in request_headers.items()
+                    if key.lower() != "login-at"
+                }
+                request_headers = merge_login_at(request_headers, token)
+                # Auth recovery has its own one-refresh/one-login limit, so it
+                # still works when the original request had only one attempt.
+                attempt -= 1
+                continue
+
+        if not auth_error and (response.status_code == 429 or response.status_code >= 500):
+            if attempt < max_retries:
                 if on_rate_limit:
                     on_rate_limit()
-                wait = max(5.0, backoff ** (attempt + 2)) + random.uniform(0.5, 1.5)
-                if const.HTTP_LOG:
-                    print(f"[api] !! Rate limit (429) hit. Waiting {wait:.1f}s...")
-                time.sleep(wait)
-                continue
-
-            # Handle too many requests or server errors (5xx)
-            if r.status_code >= 500:
-                # Check if it's actually an auth error disguised as 500
-                auth_err = False
-                try:
-                    body = r.json()
-                    msg = (body.get("errmsg") or body.get("message") or "").lower()
-                    if "logged in" in msg or "login" in msg:
-                        auth_err = True
-                except Exception:
-                    pass
-
-                if not auth_err:
-                    if on_rate_limit:
-                        on_rate_limit()
-                    wait = min(3.0, backoff ** attempt) + random.uniform(0.2, 0.8)
-                    time.sleep(wait)
-                    continue
-
-            # Handle auth refresh-and-retry for all endpoints except login/refresh
-            if allow_refresh and (refresh_fn or login_fn) and not did_login:
-                trigger_refresh = False
-                if r.status_code in (401, 403):
-                    trigger_refresh = True
+                if response.status_code == 429:
+                    delay = max(5.0, backoff ** (attempt + 2)) + random.uniform(0.5, 1.5)
                 else:
-                    msg = ""
-                    try:
-                        body = r.json()
-                        msg = (body.get("errmsg") or body.get("message") or "").lower()
-                    except Exception:
-                        pass
-                    if "token" in msg and "expire" in msg:
-                        trigger_refresh = True
-                    elif "logged in" in msg or "login" in msg:
-                        trigger_refresh = True
-
-                if trigger_refresh:
-                    try:
-                        success = False
-                        # Try refresh first
-                        if refresh_fn and not did_refresh:
-                            if const.HTTP_LOG:
-                                print("[api] Session expired, trying refresh...")
-                            try:
-                                refresh_fn()
-                                did_refresh = True
-                                success = True
-                            except Exception:
-                                if const.HTTP_LOG:
-                                    print("[api] Refresh failed.")
-                        
-                        # Try full login if refresh failed or not available
-                        if not success and login_fn and not did_login:
-                            if const.HTTP_LOG:
-                                print("[api] Refresh failed or unavailable, trying full re-login...")
-                            try:
-                                login_fn()
-                                did_login = True
-                                success = True
-                            except Exception as e:
-                                if const.HTTP_LOG:
-                                    print(f"[api] Re-login failed: {e}")
-
-                        if success:
-                            # Retry original request once
-                            r = session.request(method, url, headers=headers, params=params, json=json, data=data, timeout=timeout)
-                    except Exception as e:
-                        if const.HTTP_LOG:
-                            print(f"[api] Auth recovery failed: {e}")
-
-            if r.json and r.status_code >= 500 and attempt < max_retries:
-                time.sleep(backoff ** attempt)
+                    delay = min(3.0, backoff ** attempt) + random.uniform(0.2, 0.8)
+                time.sleep(delay)
                 continue
-            return r
-        except requests.RequestException as e:
-            if const.HTTP_LOG:
-                print(f"[api] !! {method} {url} failed on attempt {attempt}: {e}")
-            last_exc = e
-            if attempt < max_retries:
-                time.sleep(backoff ** attempt)
-                continue
-            raise
-    if last_exc:
-        raise last_exc
-    return r
+        return response
