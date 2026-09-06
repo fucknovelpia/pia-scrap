@@ -1,6 +1,29 @@
 # -*- mode: python ; coding: utf-8 -*-
 # PyInstaller spec for PIA Scrap (Novelpia Global downloader)
 
+from pathlib import Path
+from runpy import run_path
+
+from PyInstaller.utils.win32.versioninfo import (
+    FixedFileInfo,
+    StringFileInfo,
+    load_version_info_from_text_file,
+)
+
+# Use the same version as the CLI and UI for the executable's Windows metadata.
+spec_dir = Path(SPECPATH)
+app_version = run_path(str(spec_dir / 'src' / '__init__.py'))['__version__']
+windows_version = tuple(int(part) for part in app_version.split('.')) + (0,)
+version_info = load_version_info_from_text_file(str(spec_dir / 'version_info.txt'))
+version_info.ffi = FixedFileInfo(filevers=windows_version, prodvers=windows_version)
+version_strings = {'FileVersion': '.'.join(map(str, windows_version)), 'ProductVersion': app_version}
+for info in version_info.kids:
+    if isinstance(info, StringFileInfo):
+        for table in info.kids:
+            for entry in table.kids:
+                if entry.name in version_strings:
+                    entry.val = version_strings[entry.name]
+
 block_cipher = None
 
 a = Analysis(
@@ -61,7 +84,7 @@ exe = EXE(
     a.datas,
     [],
     name='PIA-Scrap',
-    version='version_info.txt',
+    version=version_info,
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
