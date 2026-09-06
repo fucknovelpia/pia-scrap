@@ -1,7 +1,5 @@
 import json
 import queue
-import shutil
-import subprocess
 import concurrent.futures
 import time
 import tempfile
@@ -14,7 +12,7 @@ from unittest.mock import Mock, patch
 import requests
 
 from src.advertisements import (
-    AdvertisementError, AdvertisementResult, _CONTINUE_AD_JS, _continue_finished_ad, _run_ad_host,
+    AdvertisementError, AdvertisementResult, _run_ad_host,
     _exception_location, _register_viewer, _unregister_viewer, watch_episode_ad,
 )
 
@@ -298,7 +296,7 @@ class AdvertisementTests(unittest.TestCase):
         invalid.extend((wrong_ticket, empty_content, error_content))
         for payload in invalid:
             with self.subTest(payload=payload):
-                host = SimpleNamespace(status=Mock(return_value="complete"), results={"gate": payload})
+                host = SimpleNamespace(status=Mock(return_value="complete"), results={"gate": payload}, continue_counts={})
                 with (
                     patch("src.advertisements._register_viewer", return_value=(host, "gate")),
                     patch("src.advertisements._unregister_viewer") as cleanup,
@@ -330,6 +328,23 @@ class AdvertisementTests(unittest.TestCase):
         _unregister_viewer(host, gate)
         self.assertEqual(host.results, {})
         self.assertEqual(host.gates, {})
+        self.assertEqual(host.continue_counts, {})
+        self.assert_browser_cleaned_up()
+
+    def test_continue_notification_survives_page_reload_and_reaches_live_log(self):
+        def publish(command):
+            if command[0] == "open":
+                gate = command[1]
+                self.statuses.put(("continued", gate))
+                self.statuses.put(("ready", gate))
+                self.statuses.put(("complete", gate, handoff()))
+        self.commands.on_put = publish
+        with patch("builtins.print") as output:
+            result = self.watch(Mock(return_value=ticket()))
+        self.assertIsInstance(result, AdvertisementResult)
+        output.assert_called_once_with(
+            "[ad] Episode 670403: Continue auto-clicked. Waiting for chapter...", flush=True,
+        )
         self.assert_browser_cleaned_up()
 
 
@@ -355,84 +370,6 @@ class AdvertisementViewerTests(unittest.TestCase):
         self.assertIn("frames=test_exception_diagnostics", description)
         self.assertNotIn("session-secret", description)
         self.assertNotIn("private-url", description)
-
-    def test_continue_waits_for_loaded_exact_viewer_and_handles_navigation(self):
-        window = Mock()
-        window.events.loaded.is_set.return_value = True
-        window.evaluate_js.return_value = True
-        for url in (
-            "http://global.novelpia.com/viewer/670403",
-            "https://global.novelpia.com.evil.test/viewer/670403",
-            "https://global.novelpia.com/viewer/670404",
-            "https://global.novelpia.com:8443/viewer/670403",
-            "https://global.novelpia.com/login",
-        ):
-            window.get_current_url.return_value = url
-            self.assertFalse(_continue_finished_ad(window, 670403))
-        window.evaluate_js.assert_not_called()
-        window.get_current_url.return_value = "https://global.novelpia.com/viewer/670403"
-        window.events.loaded.is_set.return_value = False
-        self.assertFalse(_continue_finished_ad(window, 670403))
-        window.evaluate_js.assert_not_called()
-        window.events.loaded.is_set.return_value = True
-        self.assertTrue(_continue_finished_ad(window, 670403))
-        window.evaluate_js.assert_called_once()
-        self.assertNotIn("__EPISODE_PATH__", window.evaluate_js.call_args.args[0])
-        window.evaluate_js.side_effect = RuntimeError("private-page-data")
-        self.assertFalse(_continue_finished_ad(window, 670403))
-
-    @unittest.skipUnless(shutil.which("node"), "Node is needed to execute the DOM helper test")
-    def test_continue_dom_check_rejects_early_hidden_disabled_and_unrelated_controls(self):
-        harness = r"""
-const vm = require('vm');
-const script = JSON.parse(require('fs').readFileSync(0, 'utf8'));
-function check(change) {
-    let clicks = 0;
-    const button = {
-        tagName: 'BUTTON', textContent: 'Continue', disabled: false,
-        matches: () => false, getAttribute: () => null,
-        getClientRects: () => [1], contains: () => false,
-        getBoundingClientRect: () => ({left: 10, top: 10, right: 110, bottom: 50, width: 100, height: 40}),
-        click: () => {clicks++;}
-    };
-    const window = {
-        location: {origin: 'https://global.novelpia.com', pathname: '/viewer/670403'},
-        innerWidth: 1000, innerHeight: 780,
-        getComputedStyle: () => ({display: 'block', visibility: 'visible', opacity: '1'})
-    };
-    const document = {
-        getElementById: id => id === 'ez-rewarded-continue-button' ? button : null,
-        elementFromPoint: () => button
-    };
-    change({button, window, document});
-    const context = vm.createContext({window, document});
-    vm.runInContext(script, context);
-    vm.runInContext(script, context);
-    return clicks;
-}
-const results = [
-    check(() => {}),
-    check(({document}) => {document.getElementById = () => null;}),
-    check(({button}) => {button.disabled = true;}),
-    check(({button}) => {button.getAttribute = () => 'true';}),
-    check(({button}) => {button.getClientRects = () => [];}),
-    check(({button}) => {button.textContent = 'Continue in 10';}),
-    check(({button}) => {button.tagName = 'DIV';}),
-    check(({document}) => {document.elementFromPoint = () => ({});}),
-    check(({window}) => {window.getComputedStyle = () => ({display:'none', visibility:'visible', opacity:'1'});}),
-    check(({window}) => {window.getComputedStyle = () => ({display:'block', visibility:'hidden', opacity:'1'});}),
-    check(({window}) => {window.getComputedStyle = () => ({display:'block', visibility:'visible', opacity:'0'});}),
-    check(({window}) => {window.location.origin = 'https://another-site.test';}),
-    check(({window}) => {window.location.pathname = '/viewer/670404';})
-];
-process.stdout.write(JSON.stringify(results));
-"""
-        script = _CONTINUE_AD_JS.replace("__EPISODE_PATH__", json.dumps("/viewer/670403"))
-        result = subprocess.run(
-            [shutil.which("node"), "-e", harness], input=json.dumps(script),
-            text=True, capture_output=True, check=True, timeout=10,
-        )
-        self.assertEqual(json.loads(result.stdout), [1] + [0] * 12)
 
     def test_viewer_closes_when_source_download_parent_exits(self):
         stop = threading.Event()
@@ -483,7 +420,6 @@ process.stdout.write(JSON.stringify(results));
         with (
             tempfile.TemporaryDirectory() as directory,
             patch("src.advertisements.const.APP_DIR", Path(directory)),
-            patch("src.advertisements._continue_finished_ad") as click_continue,
             patch("src.advertisements.threading.Thread") as monitor,
             patch.dict("sys.modules", {"webview": webview, "pythonnet": SimpleNamespace(load=Mock())}),
         ):
@@ -492,6 +428,8 @@ process.stdout.write(JSON.stringify(results));
             self.assertTrue(calls[0].kwargs["hidden"])
             for call in calls[1:]:
                 self.assertTrue(call.kwargs["hidden"])
+                self.assertEqual((call.kwargs["width"], call.kwargs["height"]), (480, 540))
+                self.assertEqual(call.kwargs["min_size"], (420, 480))
                 self.assertIn("Preparing advertisement", call.kwargs["html"])
                 self.assertEqual(len(call.args), 1)
                 self.assertNotIn("url", call.kwargs)
@@ -500,7 +438,6 @@ process.stdout.write(JSON.stringify(results));
                 "storage_path": str(Path(directory) / ".webview_data"),
             })
             self.assertTrue((Path(directory) / ".webview_data").is_dir())
-            click_continue.assert_not_called()
             self.assertEqual(monitor.call_count, 2)
             self.assertTrue(all(call.kwargs["daemon"] for call in monitor.call_args_list))
         first.destroy.assert_called_once_with()
@@ -518,9 +455,10 @@ process.stdout.write(JSON.stringify(results));
         payload = handoff()
         step = 0
 
-        def install(window, episode_no, on_complete, on_error, on_diagnostic=None):
+        def install(window, episode_no, on_complete, on_error, on_diagnostic=None, on_continue=None):
             self.assertIs(window, viewer)
             self.assertEqual(episode_no, 670403)
+            on_continue()
             on_complete(payload)
             completed.set()
 
@@ -547,6 +485,7 @@ process.stdout.write(JSON.stringify(results));
         ):
             _run_ad_host(stop, SimpleNamespace(get=Mock(side_effect=get_command)), statuses)
             log = (Path(directory) / "output" / "logs" / "advertisements.log").read_text(encoding="utf-8")
+        self.assertEqual(statuses.get_nowait(), ("continued", "specific-gate"))
         self.assertEqual(statuses.get_nowait(), ("complete", "specific-gate", payload))
         self.assertEqual(statuses.get_nowait(), ("closed", None))
         self.assertIn("Received viewer content for episode 670403", log)
@@ -574,7 +513,7 @@ process.stdout.write(JSON.stringify(results));
         self.assertEqual(statuses.get_nowait(), ("closed", None))
         self.assertTrue(statuses.empty())
 
-    def test_hung_continue_check_does_not_block_other_windows_or_shutdown(self):
+    def test_hung_viewer_setup_does_not_block_other_windows_or_shutdown(self):
         stop = threading.Event()
         first_blocked = threading.Event()
         second_checked = threading.Event()
@@ -602,7 +541,7 @@ process.stdout.write(JSON.stringify(results));
             stop.set()
             raise queue.Empty
 
-        def continue_check(window, episode_no):
+        def install_slow(window, episode_no, *args, **kwargs):
             if window is first:
                 first_blocked.set()
                 release_first.wait(10)
@@ -618,7 +557,7 @@ process.stdout.write(JSON.stringify(results));
             with (
                 tempfile.TemporaryDirectory() as directory,
                 patch("src.advertisements.const.APP_DIR", Path(directory)),
-                patch("src.advertisements._continue_finished_ad", side_effect=continue_check),
+                patch("src.ad_viewer.install_viewer_handoff", side_effect=install_slow),
                 patch.dict("sys.modules", {"webview": webview, "pythonnet": SimpleNamespace(load=Mock())}),
             ):
                 _run_ad_host(stop, SimpleNamespace(get=Mock(side_effect=get_command)), statuses)

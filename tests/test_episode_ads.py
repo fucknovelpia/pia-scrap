@@ -66,6 +66,21 @@ class EpisodeAdvertisementTests(unittest.TestCase):
             client.episode_ticket(670403)
         browser.assert_not_called()
 
+    def test_ad_logs_explain_auto_continue_and_confirm_received_chapter(self):
+        client = NovelpiaClient(throttle=0)
+        with (
+            patch.object(client, "_episode_ticket_response", return_value=response()),
+            patch("src.api.watch_episode_ad", return_value=self._captured_episode(675194)),
+            patch("builtins.print") as output,
+        ):
+            client.episode_ticket(675194)
+        messages = [call.args[0] for call in output.call_args_list]
+        self.assertEqual(len(messages), 2)
+        self.assertIn("Continue will be auto-clicked when the ad finishes.", messages[0])
+        self.assertNotIn("If prompted", messages[0])
+        self.assertEqual(messages[1], "[ad] Episode 675194: Advertisement complete. Chapter received; resuming download.")
+        self.assertTrue(all(call.kwargs.get("flush") for call in output.call_args_list))
+
     @staticmethod
     def _captured_episode(episode_no):
         """The viewer already used this ticket while loading the real chapter."""

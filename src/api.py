@@ -260,8 +260,8 @@ class NovelpiaClient:
         r = self._episode_ticket_response(episode_no)
         if _is_ad_required(r):
             print(
-                f"[ad] Episode {episode_no} requires an advertisement. Opening the official viewer; "
-                "allow the ad to finish. If prompted, sign in with the same Novelpia account."
+                f"[ad] Episode {episode_no} requires an advertisement. Opening the ad window; "
+                "Continue will be auto-clicked when the ad finishes.", flush=True,
             )
             r = watch_episode_ad(
                 episode_no,
@@ -270,11 +270,11 @@ class NovelpiaClient:
                 is_unlocked=_has_episode_ticket,
             )
             if isinstance(r, AdvertisementResult):
-                print(f"[ad] Received episode {episode_no} from the completed advertisement. Resuming download.")
+                print(f"[ad] Episode {episode_no}: Advertisement complete. Chapter received; resuming download.", flush=True)
                 data = dict(r.ticket)
                 data["_viewer_content"] = r.content
                 return data
-            print(f"[ad] Novelpia unlocked episode {episode_no}. Resuming download.")
+            print(f"[ad] Episode {episode_no}: Access confirmed. Resuming download.", flush=True)
         if r.status_code >= 400:
             raise requests.HTTPError(describe_http_error(r), response=r)
         return r.json()

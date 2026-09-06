@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import re
+import secrets
 import threading
 import time
 from typing import Callable
@@ -239,6 +240,7 @@ def install_viewer_handoff(
     on_complete: Callable[[dict], None],
     on_error: Callable[[], None],
     on_diagnostic: Callable[[str], None] | None = None,
+    on_continue: Callable[[], None] | None = None,
 ) -> None:
     """Prepare a neutral hidden Edge window before loading the real viewer.
 
@@ -250,6 +252,8 @@ def install_viewer_handoff(
     failed = threading.Event()
     collector = _ResponseHandoff(episode_no, on_complete)
     registered = {}
+    bridge_token = secrets.token_urlsafe(32)
+    continued_clicks = set()
 
     def diagnostic(message: str) -> None:
         if on_diagnostic is not None:
@@ -348,14 +352,71 @@ def install_viewer_handoff(
             except Exception as exc:
                 diagnostic_error("Response observer", exc)
 
+        def continue_message(args):
+            try:
+                raw = str(args.get_WebMessageAsJson())
+                if len(raw) > 8192:
+                    return None
+                message = json.loads(raw)
+                if isinstance(message, dict) and message.get("type") == "pia-ad-continue":
+                    return message
+            except Exception:
+                pass
+            return None
+
+        def on_message(sender, args):
+            if stopped.is_set() or collector.completed.is_set():
+                return
+            try:
+                message = continue_message(args)
+                if message is None or not _viewer_url_matches(str(args.Source), episode_no):
+                    return
+                if not _viewer_url_matches(str(sender.Source), episode_no):
+                    return
+                token = message.get("token")
+                click_id = message.get("click_id")
+                if (
+                    type(message.get("episode_no")) is not int
+                    or message["episode_no"] != episode_no
+                    or not isinstance(token, str) or not secrets.compare_digest(token, bridge_token)
+                    or not isinstance(click_id, str) or not 1 <= len(click_id) <= 128
+                    or click_id in continued_clicks
+                ):
+                    return
+                continued_clicks.add(click_id)
+                if on_continue is not None:
+                    on_continue()
+            except Exception as exc:
+                diagnostic_error("Continue message observer", exc)
+
         def prepare():
+            from src.ad_continue import CONTINUE_AD_JS
+
             core = native.webview.CoreWebView2
             if core is None:
                 raise RuntimeError("Edge WebView2 is unavailable")
             core.WebResourceResponseReceived += on_response
+            core.WebMessageReceived += on_message
             registered["core"] = core
             registered["response_handler"] = on_response
-            script = _SPOILER_GUARD_JS.replace("__EPISODE_PATH__", json.dumps(f"/viewer/{episode_no}"))
+            registered["message_handler"] = on_message
+            # pywebview's normal bridge expects a three-element JSON array.
+            # Preserve it for its own messages and keep our native notification
+            # objects out of that parser (and its exception logger).
+            stock_handler = getattr(getattr(native, "browser", None), "on_script_notify", None)
+            if stock_handler is not None:
+                def forward_stock_message(sender, args):
+                    if continue_message(args) is None:
+                        stock_handler(sender, args)
+
+                native.webview.WebMessageReceived -= stock_handler
+                native.webview.WebMessageReceived += forward_stock_message
+                registered["stock_message_forwarder"] = forward_stock_message
+            script = (
+                _SPOILER_GUARD_JS + "\n" + CONTINUE_AD_JS
+            ).replace("__EPISODE_PATH__", json.dumps(f"/viewer/{episode_no}"))
+            script = script.replace("__EPISODE_NO__", str(episode_no))
+            script = script.replace("__BRIDGE_TOKEN__", json.dumps(bridge_token))
             return core.AddScriptToExecuteOnDocumentCreatedAsync(script)
 
         task = on_ui(prepare)

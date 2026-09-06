@@ -5,7 +5,7 @@ import sys
 import threading
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 from src.ad_viewer import (
     _ResponseHandoff, _SPOILER_GUARD_JS, _SSR_TICKET_JS, _response_kind, _viewer_url_matches,
@@ -138,10 +138,12 @@ class NativeSetupTests(unittest.TestCase):
     def setUp(self):
         self.addCleanup(patch.stopall)
         patch.dict(sys.modules, {"System": SimpleNamespace(Action=lambda callback: callback)}).start()
+        patch("src.ad_viewer.secrets.token_urlsafe", return_value="test-bridge-token").start()
         self.sequence = []
         self.task = Task()
         self.core = SimpleNamespace(
             WebResourceResponseReceived=Event(),
+            WebMessageReceived=Event(),
             AddScriptToExecuteOnDocumentCreatedAsync=Mock(side_effect=self.register_script),
             Source="https://global.novelpia.com/viewer/42",
             ExecuteScriptAsync=Mock(return_value=SimpleNamespace(
@@ -155,9 +157,14 @@ class NativeSetupTests(unittest.TestCase):
             load_url=Mock(side_effect=lambda url: self.sequence.append("navigate")),
         )
         self.window.events.loaded.set()
+        self.stock_message = Mock()
+        self.window.native.browser = SimpleNamespace(on_script_notify=self.stock_message)
+        self.window.native.webview.WebMessageReceived = Event()
+        self.window.native.webview.WebMessageReceived += self.stock_message
         self.window.native.BeginInvoke = Mock(side_effect=lambda callback: callback())
         self.complete = Mock()
         self.error = Mock()
+        self.continued = Mock()
 
     def tearDown(self):
         for handler in self.window.events.closed.handlers:
@@ -165,12 +172,19 @@ class NativeSetupTests(unittest.TestCase):
 
     def register_script(self, script):
         self.assertEqual(len(self.core.WebResourceResponseReceived.handlers), 1)
+        self.assertEqual(len(self.core.WebMessageReceived.handlers), 1)
         self.assertIn('"/viewer/42"', script)
         self.sequence.append("register")
         return self.task
 
     def install(self):
-        install_viewer_handoff(self.window, 42, self.complete, self.error)
+        install_viewer_handoff(self.window, 42, self.complete, self.error, on_continue=self.continued)
+
+    def message_args(self, message=None, source="https://global.novelpia.com/viewer/42"):
+        if message is None:
+            message = {"type": "pia-ad-continue", "episode_no": 42,
+                       "token": "test-bridge-token", "click_id": "first-click"}
+        return SimpleNamespace(Source=source, get_WebMessageAsJson=lambda: json.dumps(message))
 
     def test_observer_and_document_start_registration_finish_before_navigation(self):
         def await_registration(task, timeout, cancelled):
@@ -213,6 +227,49 @@ class NativeSetupTests(unittest.TestCase):
         args.Request.Uri = "https://ads.example.com/v1/novel/episode?episode_no=42"
         callback(SimpleNamespace(Source="https://global.novelpia.com/viewer/42"), args)
         response.GetContentAsync.assert_not_called()
+
+    def test_continue_bridge_validates_source_episode_nonce_and_unique_click(self):
+        self.install()
+        callback = self.core.WebMessageReceived.handlers[0]
+        valid = {"type": "pia-ad-continue", "episode_no": 42,
+                 "token": "test-bridge-token", "click_id": "first-click"}
+        for source in ["https://evil.example/viewer/42", "https://global.novelpia.com/viewer/43",
+                       "https://name@global.novelpia.com/viewer/42"]:
+            callback(self.core, self.message_args(source=source))
+        for message in [
+            {**valid, "episode_no": 43}, {**valid, "episode_no": "42"},
+            {**valid, "token": "wrong"}, {**valid, "type": "other"},
+            {**valid, "click_id": ""}, {**valid, "click_id": "x" * 129},
+        ]:
+            callback(self.core, self.message_args(message))
+        callback(SimpleNamespace(Source="https://global.novelpia.com/viewer/43"), self.message_args())
+        self.continued.assert_not_called()
+        callback(self.core, self.message_args())
+        callback(self.core, self.message_args())
+        self.continued.assert_called_once_with()
+        callback(self.core, self.message_args({**valid, "click_id": "new-document-click"}))
+        self.assertEqual(self.continued.call_count, 2)
+        self.complete.assert_not_called()
+
+    def test_continue_notification_does_not_replace_other_pywebview_messages(self):
+        self.install()
+        forwarder = self.window.native.webview.WebMessageReceived.handlers
+        self.assertEqual(len(forwarder), 1)
+        normal = self.message_args(["usual_function", "{}", "result-id"])
+        files_dropped = self.message_args("FilesDropped")
+        forwarder[0](self.core, normal)
+        forwarder[0](self.core, files_dropped)
+        forwarder[0](self.core, self.message_args())
+        self.stock_message.assert_has_calls([call(self.core, normal), call(self.core, files_dropped)])
+        self.assertEqual(self.stock_message.call_count, 2)
+
+    def test_continue_bridge_stops_when_viewer_closes(self):
+        self.install()
+        callback = self.core.WebMessageReceived.handlers[0]
+        for handler in self.window.events.closed.handlers:
+            handler()
+        callback(self.core, self.message_args())
+        self.continued.assert_not_called()
 
     def test_native_read_diagnostics_exclude_sensitive_exception_text(self):
         diagnostics = []

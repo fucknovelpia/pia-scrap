@@ -128,10 +128,12 @@ Or do it from the UI with:
 
 When a chapter requires an advertisement (`0010`), the downloader opens that
 chapter in the official viewer using the app's browser profile. Let the real ad
-finish; the app presses the normal Continue button after the countdown, then
+finish; the compact ad window clicks the normal Continue button as soon as it
+becomes ready, without waiting for other page resources to finish loading, then
 receives the chapter directly from the viewer's successful server responses,
 closes the window, and resumes. Chapter text and titles stay hidden in ad windows
-to prevent spoilers. Each download worker
+to prevent spoilers. The live log reports the automatic Continue click and each
+completed advertisement. Each download worker
 can open its own ad window, so **Threads = 4** allows up to four simultaneous ad
 windows sharing the same signed-in browser profile. If the viewer asks you
 to sign in, use the same account as the downloader. Closing an ad before it

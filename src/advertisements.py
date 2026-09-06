@@ -2,14 +2,12 @@
 from __future__ import annotations
 
 import multiprocessing
-import json
 import queue
 import threading
 import time
 import uuid
 from dataclasses import dataclass
 from typing import Callable
-from urllib.parse import urlsplit
 
 import requests
 
@@ -66,58 +64,6 @@ def _exception_location(exc: Exception) -> str:
         details.append("frames=" + ">".join(locations))
     return ", ".join(details)
 
-# This activates only the ordinary Continue control exposed by the provider
-# after its own countdown. The website still decides when the ad is finished.
-_CONTINUE_AD_JS = r"""
-(function() {
-    var expectedPath = __EPISODE_PATH__;
-    if (window.location.origin !== 'https://global.novelpia.com' ||
-        (window.location.pathname !== expectedPath &&
-         window.location.pathname !== expectedPath + '/')) return false;
-    var button = document.getElementById('ez-rewarded-continue-button');
-    if (!button || button.tagName !== 'BUTTON' || button.__piaAdContinueClicked ||
-        button.disabled || button.matches(':disabled') ||
-        button.getAttribute('aria-disabled') === 'true' ||
-        button.textContent.trim() !== 'Continue' ||
-        button.getClientRects().length === 0) return false;
-    var style = window.getComputedStyle(button);
-    var rect = button.getBoundingClientRect();
-    if (style.display === 'none' || style.visibility !== 'visible' ||
-        Number(style.opacity) === 0 || rect.width <= 0 || rect.height <= 0 ||
-        rect.bottom <= 0 || rect.right <= 0 ||
-        rect.top >= window.innerHeight || rect.left >= window.innerWidth) return false;
-    var x = (Math.max(0, rect.left) + Math.min(window.innerWidth, rect.right)) / 2;
-    var y = (Math.max(0, rect.top) + Math.min(window.innerHeight, rect.bottom)) / 2;
-    var visibleTarget = document.elementFromPoint(x, y);
-    if (visibleTarget !== button && !button.contains(visibleTarget)) return false;
-    button.__piaAdContinueClicked = true;
-    button.click();
-    return true;
-})();
-"""
-
-
-def _continue_finished_ad(window, episode_no: int) -> bool:
-    """Click the provider's visible, enabled Continue button on this viewer."""
-    try:
-        if not window.events.loaded.is_set():
-            return False
-        url = urlsplit(window.get_current_url() or "")
-        expected_path = f"/viewer/{episode_no}"
-        if (
-            url.scheme != "https" or url.hostname != "global.novelpia.com"
-            or url.port not in (None, 443) or url.username or url.password
-            or url.path not in (expected_path, expected_path + "/")
-        ):
-            return False
-        return window.evaluate_js(
-            _CONTINUE_AD_JS.replace("__EPISODE_PATH__", json.dumps(expected_path))
-        ) is True
-    except Exception:
-        # Navigation can interrupt the check. Retry without logging page data.
-        return False
-
-
 def _run_ad_host(stop, commands, statuses) -> None:
     """Host independent viewer windows together in one persistent profile."""
     parent = multiprocessing.parent_process()
@@ -160,7 +106,7 @@ def _run_ad_host(stop, commands, statuses) -> None:
                 window = webview.create_window(
                     f"Novelpia -- Advertisement for episode {episode_no}",
                     html="<html><body>Preparing advertisement...</body></html>",
-                    width=1000, height=780, hidden=True,
+                    width=480, height=540, min_size=(420, 480), hidden=True,
                 )
 
                 def on_closed() -> None:
@@ -194,25 +140,22 @@ def _run_ad_host(stop, commands, statuses) -> None:
                         _log_browser_event(f"Viewer handoff setup failed for episode {episode_no}.")
                         statuses.put(("error", gate_id))
 
-                def continue_when_ready() -> None:
+                def on_continue() -> None:
+                    statuses.put(("continued", gate_id))
+                    _log_browser_event(f"Auto-clicked Continue for episode {episode_no}.")
+
+                def prepare_viewer() -> None:
                     try:
                         install_viewer_handoff(
                             window, episode_no, on_complete, on_error,
                             lambda message: _log_browser_event(f"Episode {episode_no}: {message}"),
+                            on_continue=on_continue,
                         )
                     except Exception:
                         on_error()
                         return
-                    while not window_closed.wait(0.5):
-                        if stop.is_set():
-                            return
-                        # Edge's JS bridge can wait indefinitely if this renderer
-                        # fails. Isolate it so other viewers and shutdown proceed.
-                        if _continue_finished_ad(window, episode_no):
-                            _log_browser_event(f"Pressed finished-ad Continue for episode {episode_no}.")
-
                 threading.Thread(
-                    target=continue_when_ready, name=f"PIA ad Continue {episode_no}",
+                    target=prepare_viewer, name=f"PIA ad setup {episode_no}",
                     daemon=True,
                 ).start()
             except Exception as exc:
@@ -302,6 +245,7 @@ class _AdvertisementHost:
     def __init__(self):
         self.gates = {}
         self.results = {}
+        self.continue_counts = {}
         self.process = None
         self.commands = None
         self.statuses = None
@@ -340,7 +284,9 @@ class _AdvertisementHost:
             for gate in targets:
                 if gate not in self.gates:
                     continue
-                if status == "complete" and target is not None and len(event) == 3:
+                if status == "continued" and target is not None:
+                    self.continue_counts[gate] = self.continue_counts.get(gate, 0) + 1
+                elif status == "complete" and target is not None and len(event) == 3:
                     self.results[gate] = event[2]
                     self.gates[gate] = "complete"
                 elif self.gates[gate] not in ("complete", "error", "closed"):
@@ -373,6 +319,7 @@ def _register_viewer(episode_no: int, cancelled: threading.Event):
         host = _VIEWER_HOST
         gate_id = uuid.uuid4().hex
         host.gates[gate_id] = "opening"
+        host.continue_counts[gate_id] = 0
         host.commands.put(("open", gate_id, episode_no))
         return host, gate_id
     finally:
@@ -385,6 +332,7 @@ def _unregister_viewer(host, gate_id: str) -> None:
         if gate_id in host.gates:
             host.gates.pop(gate_id)
             host.results.pop(gate_id, None)
+            host.continue_counts.pop(gate_id, None)
             host.commands.put(("close", gate_id, None))
         if not host.gates:
             # Finish using the profile before another caller starts a new host.
@@ -435,11 +383,16 @@ def watch_episode_ad(
     host, gate_id = _register_viewer(episode_no, cancelled)
     try:
         deadline = time.monotonic() + timeout
+        reported_continues = 0
         while True:
             check_cancelled()
             with _HOST_LOCK:
                 status = host.status(gate_id)
                 payload = host.results.get(gate_id)
+                continue_count = host.continue_counts.get(gate_id, 0)
+            if continue_count > reported_continues:
+                print(f"[ad] Episode {episode_no}: Continue auto-clicked. Waiting for chapter...", flush=True)
+                reported_continues = continue_count
             if status == "complete":
                 from src.ad_viewer import validate_handoff
                 if not validate_handoff(payload, episode_no):
